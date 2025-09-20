@@ -1,0 +1,1381 @@
+# utils/global_config.py
+
+import json
+import os
+import logging
+import time # ADDED
+import inspect # ADDED
+from dataclasses import dataclass, field, asdict # MODIFIED: Added asdict
+from typing import Optional, Dict, Any, TYPE_CHECKING
+from utils.flicker_filter_config import FlickerFilterParams
+from utils.testrade_modes import (
+    TestradeMode, 
+    get_current_mode, 
+    is_tank_sealed, 
+    is_tank_buffered, 
+    is_live_mode,
+    requires_telemetry_service,
+    requires_ipc_services,
+    requires_external_publishing,
+    get_mode_description
+)
+
+# ADDED: Import IPC client interface (adjust path if ipc_interfaces.py is elsewhere)
+try:
+    from core.ipc_interfaces import IBulletproofBabysitterIPCClient
+except ImportError:
+    # Define a placeholder if the interface isn't available during isolated testing/linting
+    # This allows the file to be parsed but will fail at runtime if not properly set up.
+    if TYPE_CHECKING:
+        from core.ipc_interfaces import IBulletproofBabysitterIPCClient
+    else:
+        IBulletproofBabysitterIPCClient = Any  # Use Any as fallback for runtime
+
+# Get the module-level logger instance
+_module_logger = logging.getLogger(__name__)
+
+class ConfigurationError(Exception):
+    """Raised when there are configuration loading or parsing errors."""
+    pass
+
+def calculate_config_diff(old_config_dict: Dict[str, Any], new_config_dict: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Calculate differences between old and new configuration dictionaries.
+    
+    Returns:
+        Dict with format: {param_name: {"old_value": old_val, "new_value": new_val}}
+    """
+    changed_params = {}
+    
+    # Check for changed values
+    for key, new_val in new_config_dict.items():
+        old_val = old_config_dict.get(key)
+        if old_val != new_val:
+            changed_params[key] = {
+                "old_value": old_val,
+                "new_value": new_val
+            }
+    
+    # Check for removed values (existed in old but not in new)
+    for key, old_val in old_config_dict.items():
+        if key not in new_config_dict:
+            changed_params[key] = {
+                "old_value": old_val,
+                "new_value": None
+            }
+    
+    return changed_params
+
+def publish_config_change_via_telemetry(
+    telemetry_service,
+    old_config_dict: Dict[str, Any],
+    new_config_dict: Dict[str, Any],
+    change_source: str = "unknown",
+    correlation_id: Optional[str] = None
+) -> bool:
+    """
+    Publish configuration change event using the new ConfigChangeEventData structure
+    via TelemetryService for consistent event handling.
+    
+    Args:
+        telemetry_service: TelemetryService instance for publishing
+        old_config_dict: Previous configuration state
+        new_config_dict: New configuration state  
+        change_source: Source of the change (e.g., "gui_command", "file_watcher")
+        correlation_id: Optional correlation ID for linking operations
+    
+    Returns:
+        bool: True if successfully published, False otherwise
+    """
+    if not telemetry_service:
+        _module_logger.warning("Cannot publish config change: TelemetryService not available")
+        return False
+    
+    try:
+        # Calculate what actually changed
+        changed_parameters = calculate_config_diff(old_config_dict, new_config_dict)
+        
+        # Only publish if something actually changed
+        if not changed_parameters:
+            _module_logger.debug("No configuration changes detected, skipping event publication")
+            return True
+            
+        # Import the event data class
+        from core.events import ConfigChangeEventData
+        
+        # Create the structured event data
+        config_change_data = ConfigChangeEventData(
+            change_timestamp=time.time(),
+            change_source=change_source,
+            changed_parameters=changed_parameters,
+            full_config_snapshot=new_config_dict,
+            correlation_id=correlation_id
+        )
+        
+        # Publish via telemetry service
+        success = telemetry_service.enqueue(
+            source_component="GlobalConfigManager",
+            event_type="TESTRADE_CONFIG_CHANGE",
+            payload=config_change_data.to_dict(),
+            stream_override="testrade:config-changes"
+        )
+        
+        if success:
+            _module_logger.info(f"Published config change event: {len(changed_parameters)} parameters changed, source: {change_source}")
+        else:
+            _module_logger.warning(f"Failed to publish config change event via telemetry service")
+            
+        return success
+        
+    except Exception as e:
+        _module_logger.error(f"Error publishing config change event: {e}", exc_info=True)
+        return False
+
+@dataclass
+class GlobalConfig:
+    # System version for bootstrap and change tracking
+    SYSTEM_VERSION_TAG: str = "TESTRADE_v_INITIAL"
+    
+
+    enable_time_sync: bool = False
+    rolling_window_seconds: int = 3
+    fetch_interval_seconds: float = 0.5
+    offset_storage_csv: str = "offsets_log.csv"
+    include_all_symbols: bool = False
+
+    # Options to disable components for memory leak testing
+    disable_lightspeed_broker: bool = False
+    disable_price_fetching_service: bool = False
+
+    # Performance tracking options
+    enable_full_performance_tracking_module: bool = False
+    ENABLE_FINE_GRAINED_PERFORMANCE_TRACKING: bool = False
+    PERF_METRICS_AUTO_CLEAR_INTERVAL_SEC: float = 3600.0 # Default 1 hour
+
+    # Decorator options
+    enable_log_decorators: bool = False
+    enable_trace_decorators: bool = False
+
+    # Feature Flags for Data Flow Refactoring
+    FEATURE_FLAG_USE_DIRECT_OCR_CONDITIONED_TO_ORCHESTRATOR: bool = True  # FIXED: Enable direct path (pipe → conditioning → orchestrator)
+    FEATURE_FLAG_USE_DIRECT_PRICE_RAW_TO_RISK_PMD: bool = False  # Default to old path (bus or less direct) initially
+
+    # Add a flag for the Observability Publisher (to enable/disable its function globally)
+    FEATURE_FLAG_ENABLE_OBSERVABILITY_PUBLISHER: bool = False  # Default to disabled initially
+
+    # Dependency Injection Container Feature Flag
+    USE_DI_CONTAINER: bool = True  # Enable DI Container to eliminate instantiation nightmares
+
+    # OCR Data Conditioning Service Configuration
+    ocr_conditioning_queue_max_size: int = 200  # Maximum queue size before backpressure
+    ocr_conditioning_workers: int = 1  # Number of worker threads for OCR conditioning
+
+    initial_share_size: int = 5000
+    add_type: str = "Equal"
+    reduce_percentage: float = 50.0
+
+    # New fields for manual add & force close
+    manual_shares: int = 500
+    force_close_delay_sec: int = 10
+    use_aggressive_chase_for_all_closes: bool = True
+
+    # OCR Signal Generator configuration
+    DEFAULT_OCR_TRADE_SIZE: int = 100
+    ocr_signal_generator_workers: int = 2
+
+    # OCR Data Conditioning configuration
+    stable_cost_confirmation_frames: int = 3
+
+    # Redis configuration for performance monitoring
+    REDIS_HOST: str = "127.0.0.1"  # Changed from "localhost" to avoid DNS resolution latency
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
+
+    # Redis connection timeouts
+    redis_connect_timeout_sec: float = 2.0
+    redis_socket_timeout_sec: float = 2.0
+    redis_retry_on_timeout: bool = True
+    redis_client_retry_on_timeout_bool: bool = True
+    redis_health_check_interval_sec: int = 30
+
+    # Redis Queue and Publisher Configs (defaults, can add per-stream if needed)
+    redis_default_queue_max_size: int = 10000
+    redis_default_publisher_threads: int = 1
+    redis_default_publisher_max_retries: int = 3
+    redis_default_publisher_retry_delay_sec: float = 0.5
+    redis_default_publisher_max_retry_delay_sec: float = 5.0
+
+    # Performance Benchmarker Redis Config
+    perf_metric_ttl_seconds: int = 7 * 24 * 60 * 60  # 7 days
+    perf_max_entries_per_metric: int = 10000
+
+    # DEPRECATED: Legacy Redis Event Publishing Configuration - TANK MODE uses Babysitter
+    # These queue sizes are kept for backward compatibility but are no longer used
+    redis_queue_raw_ocr_max_size: int = 500
+    redis_queue_cleaned_ocr_max_size: int = 500
+    redis_queue_order_request_max_size: int = 200
+    redis_queue_validated_order_max_size: int = 200
+    redis_queue_order_fills_max_size: int = 300
+    redis_queue_order_status_max_size: int = 500
+    redis_queue_order_rejections_max_size: int = 100
+    redis_queue_market_ticks_max_size: int = 2000
+    redis_queue_market_quotes_max_size: int = 2000
+
+    # Telemetry Service Configuration (when USE_DIRECT_IPC_TELEMETRY = False)
+    TELEMETRY_BATCH_SIZE: int = 200  # Messages per batch
+    TELEMETRY_BATCH_TIMEOUT_SEC: float = 0.05  # 50ms batch timeout
+    TELEMETRY_MAX_PUBLISH_RATE_PER_SEC: int = 500  # Max publish rate
+    TELEMETRY_HEALTH_CHECK_INTERVAL_SEC: float = 1.0  # Health check interval
+    
+    # Recording control flags
+    enable_image_recording: bool = False  # DEPRECATED - image-grabs stream removed, using binary transport
+    enable_raw_ocr_recording: bool = True  # Control raw OCR events
+    enable_intellisense_logging: bool = False  # Control IntelliSense capture logs
+    enable_network_diagnostics: bool = False  # Control network health monitoring and diagnostics
+
+    # System Health Monitoring Configuration (BA20 Specification + Parallel Execution)
+    system_health_monitoring_interval_sec: float = 2.0  # Main polling interval for health monitoring (SME: 1-2s)
+    system_health_baseline_interval: float = 60.0  # Baseline publishing interval in seconds
+    system_health_alert_cooldown_period_sec: float = 300.0  # Alert cooldown period in seconds
+
+    # Parallel Metric Gathering Configuration
+    system_health_metric_gather_workers: int = 4  # ThreadPoolExecutor workers for parallel metric collection
+    system_health_metric_gather_timeout_sec: float = 0.1  # Timeout per metric group (100ms)
+
+    # System Resource Thresholds
+    system_health_cpu_threshold: float = 80.0  # Overall system CPU usage percentage threshold
+    system_health_app_core_cpu_threshold: float = 70.0  # ApplicationCore process CPU threshold
+    system_health_ocr_process_cpu_threshold: float = 70.0  # OCR process CPU threshold
+    system_health_memory_threshold: float = 85.0  # Memory usage percentage threshold
+    system_health_disk_threshold: float = 90.0  # Disk usage percentage threshold
+
+    # OCR Subsystem Health Thresholds
+    system_health_ocr_process_max_cpu_percent: float = 90.0  # OCR process CPU usage threshold
+    system_health_ocr_conditioning_max_q_size: int = 150  # OCR conditioning queue size threshold
+
+    # EventBus Health Thresholds
+    system_health_event_bus_max_queue_size: int = 5000  # EventBus queue size threshold
+    system_health_event_bus_max_avg_processing_ms: int = 100  # EventBus average processing time threshold
+
+    # Risk Service Health Thresholds
+    system_health_risk_max_latency_p95_ms: int = 200  # Risk service P95 latency threshold
+    system_health_risk_max_pmd_queue_size: int = 100  # Risk PMD queue size threshold (if available)
+
+    # Market Data Pipeline Health Thresholds
+    system_health_market_data_mmap_max_fill_pct: float = 90.0  # Market data mmap buffer fill percentage threshold
+    system_health_market_data_bulk_channel_clogged_duration_sec: int = 60  # Channel clogging duration threshold
+
+    # Market data streaming control (MAJOR MEMORY IMPACT)
+    enable_internal_market_data_streaming: bool = True  # TEMP DEBUG: Enable for market data testing
+
+    # TANK Mode: IPC Data Dumping Control (MAJOR MEMORY IMPACT)
+    ENABLE_IPC_DATA_DUMP: bool = True  # Control all IPC data flows to Babysitter/Redis
+    
+    # AEGIS PRIME Telemetry Configuration
+    TELEMETRY_SERVICE_ENDPOINT: str = 'tcp://127.0.0.1:7777'  # ZMQ endpoint for Telemetry Service
+    TELEMETRY_CLIENT_BUFFER_SIZE: int = 1000  # Local deque buffer size for micro-outage resilience
+    
+    # Legacy flag (no longer used - Aegis Prime is the only path)
+    USE_DIRECT_IPC_TELEMETRY: bool = True  # Deprecated - Aegis Prime always uses direct path
+
+    # GUI Architecture Feature Flags
+    FEATURE_FLAG_GUI_USE_XREAD_AND_BOOTSTRAP_API: bool = True  # 🚨 ENABLED: Use Bootstrap API + XREAD architecture
+
+    # Development mode controls (reduces volume without breaking tools)
+    development_mode: bool = True  # Reduces logging/storage volume for development
+
+    # Logging control flags (MAJOR LOG FILE IMPACT)
+    log_level: str = "INFO"  # ERROR, WARNING, INFO, DEBUG
+    enable_ocr_debug_logging: bool = False  # Control OCR debug verbosity
+
+    # Stream size limits (prevent memory accumulation)
+    redis_stream_max_length: int = 500  # Max messages per stream (reduced from 1000 for market hours performance)
+    redis_stream_ttl_seconds: int = 3600  # 1 hour default TTL
+
+    # Redis stream names
+    redis_stream_raw_ocr: str = "testrade:raw-ocr-events"
+    redis_stream_cleaned_ocr: str = "testrade:cleaned-ocr-snapshots"
+    redis_stream_order_requests: str = "testrade:order-requests"
+    redis_stream_validated_orders: str = "testrade:validated-orders"
+    redis_stream_order_fills: str = "testrade:order-fills"
+    redis_stream_order_status: str = "testrade:order-status"
+    redis_stream_order_rejections: str = "testrade:order-rejections"
+    redis_stream_market_ticks: str = "testrade:filtered:market-trades"
+    redis_stream_market_quotes: str = "testrade:filtered:market-quotes"
+    redis_stream_market_trades: str = "testrade:market-data:trades"
+    redis_stream_filtered_market_quotes: str = "testrade:market-data:quotes"
+    redis_stream_risk_actions: str = "testrade:risk-actions"  # For "Trade Stopped by Risk"
+    redis_stream_position_updates: str = "testrade:position-updates"  # For PositionManager updates
+    redis_stream_enriched_position_updates: str = "testrade:enriched-position-updates"  # For enriched position updates with market data
+    redis_stream_image_grabs: str = "testrade:image-grabs"  # DEPRECATED - using binary multipart transport
+    redis_stream_broker_raw_messages: str = "testrade:broker-raw-messages"  # For raw broker communications
+    redis_stream_broker_errors: str = "testrade:broker-errors"  # For broker connection errors
+    redis_stream_trade_lifecycle_events: str = "testrade:trade-lifecycle-events"  # For trade state transitions
+    redis_stream_trading_state_changes: str = "testrade:trading-state-changes"  # For trading enable/disable events
+    redis_stream_config_changes: str = "testrade:config-changes"  # For configuration updates
+    redis_stream_maf_decisions: str = "testrade:maf-decisions"  # For MasterActionFilter decisions (suppressed/override events)
+    redis_stream_signal_decisions: str = "testrade:signal-decisions"  # For OCR signal generation decisions and analysis
+    redis_stream_execution_decisions: str = "testrade:execution-decisions"  # For trade execution decisions and analysis
+    # DEPRECATED: Legacy GUI command streams - REMOVED in Phase 2-4 architecture
+    # These are kept for backward compatibility but should not be used in new code
+    redis_stream_gui_commands: str = "testrade:gui-commands"  # DEPRECATED - use redis_stream_commands_from_gui
+    redis_stream_command_responses: str = "testrade:gui-command-responses"  # DEPRECATED - use redis_stream_responses_to_gui
+
+    # Phase 1: New Command/Response Architecture
+    redis_stream_commands_from_gui: str = "testrade:commands:from_gui"  # GUI Backend -> Babysitter -> Core/OCR
+    redis_stream_responses_to_gui: str = "testrade:responses:to_gui"  # Core/OCR -> Babysitter -> GUI Backend
+    redis_stream_core_health: str = "testrade:health:core"  # Core health monitoring
+    redis_stream_babysitter_health: str = "testrade:health:babysitter"  # Babysitter health monitoring
+    redis_stream_redis_instance_health: str = "testrade:health:redis_instance"  # Redis instance health monitoring
+    redis_stream_ipc_alerts: str = "testrade:alerts:ipc"  # IPC alerts and notifications
+
+    # PROJECT UNFUZZIFY: Unified timeline stream for perfect chronological ordering
+    redis_stream_unified_timeline: str = "testrade:unified-timeline"  # TCS output stream with nanosecond-ordered events
+
+    # For MarketDataFilterService (if adopted)
+    redis_stream_internal_raw_trades: str = "testrade:filtered:market-trades"
+    redis_stream_internal_raw_quotes: str = "testrade:filtered:market-quotes"
+    # IntelliSense would then consume from redis_stream_market_ticks and redis_stream_market_quotes
+    # which would be populated by MarketDataFilterService
+
+    # Babysitter Service IPC Configuration
+    BABYSITTER_IPC_ADDRESS: str = "tcp://127.0.0.1:5555"  # ZeroMQ address for Babysitter communication
+    BABYSITTER_ENABLED: bool = True  # Enable/disable Babysitter service integration
+
+    # Phase 1: Command/Response IPC Configuration
+    babysitter_ipc_address: str = "tcp://127.0.0.1:5555"  # Core PUSHes data TO this Babysitter PULL address
+    core_ipc_command_pull_address: str = "tcp://127.0.0.1:5560"  # Core PULLS commands FROM this (Babysitter PUSHes to it)
+    ocr_ipc_command_pull_address: str = "tcp://127.0.0.1:5559"  # OCR PULLS commands FROM this (Babysitter PUSHes to it)
+
+    # MarketDataFilterService consumer group configuration
+    redis_mdfs_consumer_group: str = "mdfs-group"
+
+    # MarketDataFilterService performance tuning parameters
+    mdfs_redis_read_batch_count: int = 100  # Messages to read per batch
+    mdfs_redis_read_block_ms: int = 200     # Block timeout in milliseconds
+    mdfs_redis_reconnect_delay_sec: float = 5.0  # Reconnection delay in seconds
+
+    # DEPRECATED: Legacy publisher configurations - TANK MODE uses Babysitter for all publishing
+    # These are kept for backward compatibility but are no longer used
+    redis_publisher_threads_raw_ocr: int = 1
+    redis_publisher_threads_cleaned_ocr: int = 1
+    redis_publisher_threads_order_requests: int = 1
+    redis_publisher_threads_validated_orders: int = 1
+    redis_publisher_threads_order_fills: int = 1
+    redis_publisher_threads_order_status: int = 1
+    redis_publisher_threads_order_rejections: int = 1
+    redis_publisher_threads_market_ticks: int = 1
+    redis_publisher_threads_market_quotes: int = 1
+
+    # DEPRECATED: Legacy publisher retry configuration
+    redis_publisher_max_retries: int = 3
+    redis_publisher_retry_delay_sec: float = 1.0
+
+    # <<< ADD Meltdown Config Fields >>>
+    # Time windows
+    meltdown_short_window_sec: float = 30.0
+    meltdown_long_window_sec: float = 90.0
+    meltdown_price_drop_window: float = 1.5
+    meltdown_momentum_window: float = 3.0
+
+    # Thresholds
+    meltdown_heavy_sell_multiplier: float = 2.5
+    meltdown_price_drop_pct: float = 0.025
+    meltdown_consecutive_bid_hits: int = 3
+    meltdown_block_multiplier: float = 4.0
+    meltdown_spread_widen_factor: float = 3.0
+    meltdown_sell_ratio_threshold: float = 0.85
+    meltdown_spread_threshold_pct: float = 0.20
+    meltdown_halt_inactivity: float = 10.0
+    meltdown_halt_min_trades: int = 5
+
+    # Aggressive Chase Parameters for Emergency Liquidation
+    meltdown_exit_chase_attempts: int = 3
+    meltdown_exit_chase_delay_ms: int = 300
+    meltdown_exit_chase_aggression_cents: float = 0.02
+
+    # New Aggressive Chase Parameters
+    meltdown_chase_max_duration_sec: float = 30.0
+    meltdown_chase_peg_update_interval_sec: float = 0.25
+    meltdown_chase_peg_aggression_ticks: int = 1
+    meltdown_chase_max_slippage_percent: float = 2.0
+    meltdown_chase_use_initial_mkt: bool = False
+    meltdown_chase_initial_aggression_ticks: int = 1
+    meltdown_chase_final_market_order: bool = True
+
+    # Chase Order State Timeout Parameters
+    CHASE_MAX_PENDING_LINK_TIME_SEC: float = 3.0  # Max time to wait for order to link from Pending
+    CHASE_MAX_ACK_WAIT_TIME_SEC: float = 5.0      # Max time to wait in AcknowledgedByBroker state
+    # Note: chase_lmt_order_active_check_duration_sec is controlled by meltdown_chase_peg_update_interval_sec
+    # <<< End ADD >>>
+
+    # Risk Management Parameters
+    risk_min_hold_seconds: float = 6.0
+    risk_catastrophic_drop_threshold: float = 0.10
+    risk_max_spread_pct_threshold: float = 0.01
+    risk_score_critical_threshold: float = 0.75
+    risk_score_high_threshold: float = 0.60
+    risk_score_elevated_threshold: float = 0.40
+    risk_max_shares_per_trade: int = 1000
+    risk_max_notional_per_trade: float = 25000.0
+    risk_max_position_size: int = 2000
+
+    # Additional Risk Management Parameters for EventBus Order Processing
+    RISK_MAX_ORDER_QTY: int = 1000  # Max order quantity for basic risk check
+
+    # Task 1.3: PMD Queue Configuration
+    risk_pmd_queue_max_size: int = 500  # Maximum PMD queue size before backpressure
+    risk_pmd_workers: int = 1  # Number of PMD worker threads
+
+    # Observability Configuration
+    observability_log_directory: str = "data/observability_logs"  # Default path for observability logs
+
+    # Circuit Breaker Configuration
+    broker_connect_failure_threshold: int = 3  # Number of failures before opening circuit
+    broker_connect_recovery_timeout_sec: int = 60  # Seconds to wait before attempting recovery
+
+    # Alpaca API Configuration
+    ALPACA_API_KEY: str = "PKR6DL0T0EQW14VH1GRM"  # Default API key (can be overridden by control.json)
+    ALPACA_API_SECRET: str = "eAbyadtWAxVhJLxpkR50EEwrsUGY6Ue4Mnoz9WwV"  # Default API secret (can be overridden by control.json)
+    ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"  # Default base URL for paper trading
+    ALPACA_DATA_URL: str = "https://data.alpaca.markets"  # Data API URL for market data
+    ALPACA_USE_PAPER_TRADING: bool = False  # Paper trading flag (Note: False but using paper URL)
+    ALPACA_SIP_URL: str = "wss://stream.data.alpaca.markets/v2/sip"  # WebSocket URL for market data
+    INITIAL_SYMBOLS_ALPACA: list = None  # Will be set to default list in __post_init__
+
+    # Price fetching fallback parameters
+    price_cache_staleness_seconds_for_fallback: float = 5.0  # How old cache can be before API fallback
+    api_fallback_min_interval_per_symbol_sec: float = 10.0  # Min time between API calls for same symbol
+    api_fallback_max_wait_ms: float = 50.0  # Max time to wait for API response in non-blocking mode
+    reliable_price_buy_offset_no_quote: float = 0.01  # Offset to add to last price when using for BUY with no quote
+    reliable_price_sell_offset_no_quote: float = 0.01  # Offset to subtract from last price when using for SELL with no quote
+
+    # Time synchronization parameters
+    feed_latency_price_match_tolerance_cents: float = 0.01  # Price tolerance for OCR-to-market latency measurement (default 1 cent)
+
+    # New parameters for conditional late entry on suppressed opens
+    suppressed_open_retry_window_seconds: float = 10.0
+    suppressed_open_price_tolerance_cents: float = 0.05
+
+    # Sync grace period to prevent premature OCR-driven closes after broker sync
+    sync_grace_period_seconds: float = 3.0
+
+    # Broker position fetching timeout for liquidation
+    broker_get_positions_timeout_sec: float = 5.0
+
+    # For ADDs (Cost Basis absolute change) - control.json is the source of truth
+    cost_basis_initial_add_abs_delta_threshold: float = 0.02 # Default - control.json overrides
+    cost_basis_settling_duration_seconds: float = 5.0 # Default - control.json overrides
+    cost_basis_settling_override_abs_delta_threshold: float = 1.0 # Default - control.json overrides
+
+    # For REDUCEs (rPnL increase) - control.json is the source of truth
+    rPnL_initial_reduce_increase_threshold: float = 50.0 # Default - control.json overrides
+    rPnL_settling_duration_seconds: float = 45.0 # Default - control.json overrides
+    rPnL_settling_override_increase_threshold: float = 100.0 # Default - control.json overrides
+
+    # Price-assisted override parameters - control.json is the source of truth
+    rPnL_settling_price_override_threshold_percent: float = 5.0 # Default - control.json overrides
+    rPnL_settling_price_override_threshold_abs: float = 0.5 # Default - control.json overrides
+
+    # OCR Preprocessing Parameters - control.json is the source of truth
+    ocr_upscale_factor: float = 3.0 # Default - control.json overrides
+    ocr_force_black_text_on_white: bool = True # Default - control.json overrides
+    ocr_unsharp_strength: float = 2.0 # Default - control.json overrides
+    ocr_threshold_block_size: int = 25 # Default - control.json overrides
+    ocr_threshold_c: int = -2 # Default - control.json overrides
+    ocr_red_boost: float = 1.0 # Default - control.json overrides
+    ocr_green_boost: float = 1.0 # Default - control.json overrides
+
+    # OCR Symbol Enhancement Parameters
+    ocr_apply_text_mask_cleaning: bool = True
+    ocr_text_mask_min_contour_area: int = 10
+    ocr_text_mask_min_width: int = 2
+    ocr_text_mask_min_height: int = 2
+    ocr_enhance_small_symbols: bool = True
+    ocr_symbol_max_height: int = 20
+    ocr_period_comma_ratio_min: float = 0.5
+    ocr_period_comma_ratio_max: float = 1.8
+    ocr_period_comma_radius: int = 3
+    ocr_hyphen_min_ratio: float = 1.8
+    ocr_hyphen_min_height: int = 2
+
+    # Video input configuration for headless replay testing
+    OCR_INPUT_VIDEO_FILE_PATH: Optional[str] = None  # Path to video file for OCR replay mode
+    ROI_COORDINATES: list = None  # Will be set to default in __post_init__
+    VIDEO_LOOP_ENABLED: bool = False  # Whether to loop video when it ends (False for long videos)
+
+    # OCR capture timing configuration
+    ocr_capture_interval_seconds: float = 0.2  # OCR capture interval in seconds
+
+    # Tesseract configuration
+    TESSERACT_CMD: str = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Path to Tesseract executable
+
+    flicker_filter: FlickerFilterParams = field(default_factory=FlickerFilterParams)
+
+    # IntelliSense Configuration (Refinement 5)
+    intellisense_mode: str = "live"  # "live" or "intellisense" - using string for JSON compatibility
+    intellisense_config: Optional[Dict[str, Any]] = None  # Will contain IntelliSenseConfig data when active
+
+    def __post_init__(self):
+        """Initialize default values for mutable fields."""
+        if self.INITIAL_SYMBOLS_ALPACA is None:
+            self.INITIAL_SYMBOLS_ALPACA = ["AAPL", "MSFT", "TESTSYM"]
+        if self.ROI_COORDINATES is None:
+            self.ROI_COORDINATES = [64, 159, 681, 296]  # Default ROI coordinates
+
+    def get(self, key: str, default=None):
+        """
+        Dictionary-like get method for compatibility with broker services.
+
+        Args:
+            key: The attribute name to get
+            default: Default value if attribute doesn't exist
+
+        Returns:
+            The attribute value or default
+        """
+        return getattr(self, key, default)
+
+    def is_intellisense_active(self) -> bool:
+        """Check if IntelliSense mode is currently active."""
+        return self.intellisense_mode == "intellisense" and self.intellisense_config is not None
+
+    # Mode detection methods for backward compatibility
+    def get_current_mode(self) -> TestradeMode:
+        """Get current TESTRADE operational mode."""
+        return get_current_mode()
+    
+    def is_tank_mode(self) -> bool:
+        """Legacy method: Check if running in any tank mode (sealed or buffered)."""
+        mode = get_current_mode()
+        return mode in [TestradeMode.TANK_SEALED, TestradeMode.TANK_BUFFERED]
+    
+    def is_tank_sealed(self) -> bool:
+        """Check if running in TANK_SEALED mode (no telemetry interfaces)."""
+        return is_tank_sealed()
+    
+    def is_tank_buffered(self) -> bool:
+        """Check if running in TANK_BUFFERED mode (telemetry with local buffering)."""
+        return is_tank_buffered()
+    
+    def is_live_mode(self) -> bool:
+        """Check if running in LIVE mode (full external publishing)."""
+        return is_live_mode()
+    
+    def should_enable_telemetry(self) -> bool:
+        """Check if telemetry services should be enabled based on mode."""
+        return requires_telemetry_service()
+    
+    def should_enable_ipc(self) -> bool:
+        """Check if IPC services should be enabled based on mode."""
+        return requires_ipc_services()
+    
+    def should_enable_external_publishing(self) -> bool:
+        """Check if external publishing should be enabled based on mode."""
+        return requires_external_publishing()
+    
+    def get_mode_description(self) -> str:
+        """Get human-readable description of current mode."""
+        return get_mode_description()
+    
+    def is_feature_enabled(self, feature_name: str) -> bool:
+        """Check if a feature is enabled considering both config flags and mode."""
+        # Get the base feature flag value
+        feature_enabled = getattr(self, feature_name, True)
+        
+        # Override based on mode for specific features
+        if feature_name == 'ENABLE_IPC_DATA_DUMP':
+            # IPC data dump is only allowed in LIVE mode
+            return feature_enabled and requires_external_publishing()
+        elif feature_name == 'ENABLE_INTELLISENSE_LOGGING':
+            # IntelliSense logging requires telemetry service
+            return feature_enabled and requires_telemetry_service()
+        
+        return feature_enabled
+
+def load_global_config(config_path: str = "utils/control.json") -> "GlobalConfig":
+    """
+    Loads configuration from a JSON file and merges it with the GlobalConfig defaults.
+    The JSON file is the source of truth and will override any defaults in the class.
+    """
+    logger = logging.getLogger(__name__)
+    
+    # 1. Start with an instance of GlobalConfig, which holds all the code-level defaults.
+    config = GlobalConfig()
+    
+    logger.info(f"Loading configuration from: {config_path}")
+    
+    try:
+        with open(config_path, 'r') as f:
+            data_from_json = json.load(f)
+            
+        # Handle flicker filter parameters
+        flicker_data = data_from_json.get("flicker_filter", {})
+        ff_params = FlickerFilterParams(
+            enable_flicker_filter=flicker_data.get("enable_flicker_filter", True),
+            known_add_shares=flicker_data.get("known_add_shares", 10000),
+            time_sync_offset_sec=flicker_data.get("time_sync_offset_sec", 0.0),
+            accept_tolerance_cents=flicker_data.get("accept_tolerance_cents", 5.0),
+            recheck_count=flicker_data.get("recheck_count", 0),
+            recheck_delay_sec=flicker_data.get("recheck_delay_sec", 0.2),
+            price_check_mode=flicker_data.get("price_check_mode", "synced_alpaca_price")
+        )
+        config.flicker_filter = ff_params
+            
+        # 2. Iterate through the defaults defined in the GlobalConfig class
+        # vars(config) gives us a dictionary of the instance's attributes
+        for key, default_value in vars(config).items():
+            # Skip special attributes and the flicker_filter we already handled
+            if key.startswith('_') or key == 'flicker_filter':
+                continue
+                
+            # Check if this key exists in the JSON file
+            if key in data_from_json:
+                # If yes, overwrite the default value with the one from the file.
+                json_value = data_from_json[key]
+                setattr(config, key, json_value)
+                logger.debug(f"Config '{key}' loaded from JSON: {json_value}")
+            else:
+                # If no, log that we are using the default value from the code.
+                logger.warning(f"Config key '{key}' not found in '{config_path}'. Using default value: {default_value}")
+
+        logger.info("Configuration loaded and merged successfully.")
+        return config
+
+    except FileNotFoundError:
+        logger.error(f"CRITICAL: Configuration file not found at '{config_path}'. Using code defaults only.")
+        # Return the config object with only the hard-coded defaults
+        return config
+    except json.JSONDecodeError as e:
+        logger.error(f"CRITICAL: Could not decode JSON from '{config_path}'. Check for syntax errors: {e}")
+        # It's safer to raise an exception here, as a broken config is a fatal error.
+        raise ConfigurationError(f"Invalid JSON in config file: {config_path}")
+    except Exception as e:
+        logger.error(f"CRITICAL: An unexpected error occurred while loading config: {e}")
+        raise
+
+def load_global_config_legacy(path: str) -> "GlobalConfig":
+    """Legacy version of load_global_config for backward compatibility."""
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    flicker_data = data.get("flicker_filter", {})
+    ff_params = FlickerFilterParams(
+        enable_flicker_filter=flicker_data.get("enable_flicker_filter", True),
+        known_add_shares=flicker_data.get("known_add_shares", 10000),
+        time_sync_offset_sec=flicker_data.get("time_sync_offset_sec", 0.0),
+        accept_tolerance_cents=flicker_data.get("accept_tolerance_cents", 5.0),
+        recheck_count=flicker_data.get("recheck_count", 0),
+        recheck_delay_sec=flicker_data.get("recheck_delay_sec", 0.2),
+        price_check_mode=flicker_data.get("price_check_mode", "synced_alpaca_price")
+    )
+
+    # DEBUG: Log the OCR capture interval being loaded
+    print(f"DEBUG_CONFIG_LOAD: ocr_capture_interval_seconds = {data.get('ocr_capture_interval_seconds', 0.2)}")
+
+    return GlobalConfig(
+        enable_time_sync=data.get("enable_time_sync", False),
+        rolling_window_seconds=data.get("rolling_window_seconds", 3),
+        fetch_interval_seconds=data.get("fetch_interval_seconds", 0.5),
+        offset_storage_csv=data.get("offset_storage_csv", "offsets_log.csv"),
+        include_all_symbols=data.get("include_all_symbols", False),
+
+        # Options to disable components for memory leak testing
+        disable_lightspeed_broker=data.get("disable_lightspeed_broker", False),
+        disable_price_fetching_service=data.get("disable_price_fetching_service", False),
+
+        # Performance tracking options
+        enable_full_performance_tracking_module=data.get("enable_full_performance_tracking_module", False),
+        ENABLE_FINE_GRAINED_PERFORMANCE_TRACKING=data.get("ENABLE_FINE_GRAINED_PERFORMANCE_TRACKING", False),
+        PERF_METRICS_AUTO_CLEAR_INTERVAL_SEC=data.get("PERF_METRICS_AUTO_CLEAR_INTERVAL_SEC", 3600.0),
+
+        # Decorator options
+        enable_log_decorators=data.get("enable_log_decorators", False),
+        enable_trace_decorators=data.get("enable_trace_decorators", False),
+
+        # Feature Flags for Data Flow Refactoring
+        FEATURE_FLAG_USE_DIRECT_OCR_CONDITIONED_TO_ORCHESTRATOR=data.get("FEATURE_FLAG_USE_DIRECT_OCR_CONDITIONED_TO_ORCHESTRATOR", True),  # FIXED: Default to True
+        FEATURE_FLAG_USE_DIRECT_PRICE_RAW_TO_RISK_PMD=data.get("FEATURE_FLAG_USE_DIRECT_PRICE_RAW_TO_RISK_PMD", False),
+
+        FEATURE_FLAG_ENABLE_OBSERVABILITY_PUBLISHER=data.get("FEATURE_FLAG_ENABLE_OBSERVABILITY_PUBLISHER", False),
+
+        # Dependency Injection Container Feature Flag
+        USE_DI_CONTAINER=data.get("USE_DI_CONTAINER", True),
+
+        # OCR Data Conditioning Service Configuration
+        ocr_conditioning_queue_max_size=data.get("ocr_conditioning_queue_max_size", 200),
+        ocr_conditioning_workers=data.get("ocr_conditioning_workers", 1),
+
+        initial_share_size=data.get("initial_share_size", 5000),
+        add_type=data.get("add_type", "Equal"),
+        reduce_percentage=data.get("reduce_percentage", 50.0),
+
+        # NEW FIELDS:
+        manual_shares=data.get("manual_shares", 500),
+        force_close_delay_sec=data.get("force_close_delay_sec", 10),
+        use_aggressive_chase_for_all_closes=data.get("use_aggressive_chase_for_all_closes", True),
+
+        # OCR Signal Generator configuration
+        DEFAULT_OCR_TRADE_SIZE=data.get("DEFAULT_OCR_TRADE_SIZE", 100),
+        ocr_signal_generator_workers=data.get("ocr_signal_generator_workers", 2),
+
+        # OCR Data Conditioning configuration
+        stable_cost_confirmation_frames=data.get("stable_cost_confirmation_frames", 3),
+
+        # Redis configuration
+        REDIS_HOST=data.get("REDIS_HOST", "127.0.0.1"),  # Changed default from "localhost"
+        REDIS_PORT=data.get("REDIS_PORT", 6379),
+        REDIS_DB=data.get("REDIS_DB", 0),
+        REDIS_PASSWORD=data.get("REDIS_PASSWORD", None),
+        redis_connect_timeout_sec=data.get("redis_connect_timeout_sec", 2.0),
+        redis_socket_timeout_sec=data.get("redis_socket_timeout_sec", 2.0),
+        redis_retry_on_timeout=data.get("redis_retry_on_timeout", True),
+        redis_client_retry_on_timeout_bool=data.get("redis_client_retry_on_timeout_bool", True),
+        redis_health_check_interval_sec=data.get("redis_health_check_interval_sec", 30),
+
+        # Redis Queue and Publisher Configs
+        redis_default_queue_max_size=data.get("redis_default_queue_max_size", 10000),
+        redis_default_publisher_threads=data.get("redis_default_publisher_threads", 1),
+        redis_default_publisher_max_retries=data.get("redis_default_publisher_max_retries", 3),
+        redis_default_publisher_retry_delay_sec=data.get("redis_default_publisher_retry_delay_sec", 0.5),
+        redis_default_publisher_max_retry_delay_sec=data.get("redis_default_publisher_max_retry_delay_sec", 5.0),
+
+        # Performance Benchmarker Redis Config
+        perf_metric_ttl_seconds=data.get("perf_metric_ttl_seconds", 7 * 24 * 60 * 60),
+        perf_max_entries_per_metric=data.get("perf_max_entries_per_metric", 10000),
+
+        # Redis Event Publishing Configuration
+        redis_queue_raw_ocr_max_size=data.get("redis_queue_raw_ocr_max_size", 500),
+        redis_queue_cleaned_ocr_max_size=data.get("redis_queue_cleaned_ocr_max_size", 500),
+        redis_queue_order_request_max_size=data.get("redis_queue_order_request_max_size", 200),
+        redis_queue_validated_order_max_size=data.get("redis_queue_validated_order_max_size", 200),
+        redis_queue_order_fills_max_size=data.get("redis_queue_order_fills_max_size", 300),
+        redis_queue_order_status_max_size=data.get("redis_queue_order_status_max_size", 500),
+        redis_queue_order_rejections_max_size=data.get("redis_queue_order_rejections_max_size", 100),
+        redis_queue_market_ticks_max_size=data.get("redis_queue_market_ticks_max_size", 2000),
+        redis_queue_market_quotes_max_size=data.get("redis_queue_market_quotes_max_size", 2000),
+        redis_stream_raw_ocr=data.get("redis_stream_raw_ocr", "testrade:raw-ocr-events"),
+        redis_stream_cleaned_ocr=data.get("redis_stream_cleaned_ocr", "testrade:cleaned-ocr-snapshots"),
+        redis_stream_order_requests=data.get("redis_stream_order_requests", "testrade:order-requests"),
+        redis_stream_validated_orders=data.get("redis_stream_validated_orders", "testrade:validated-orders"),
+        redis_stream_order_fills=data.get("redis_stream_order_fills", "testrade:order-fills"),
+        redis_stream_order_status=data.get("redis_stream_order_status", "testrade:order-status"),
+        redis_stream_order_rejections=data.get("redis_stream_order_rejections", "testrade:order-rejections"),
+        redis_stream_market_ticks=data.get("redis_stream_market_ticks", "testrade:filtered:market-trades"),
+        redis_stream_market_quotes=data.get("redis_stream_market_quotes", "testrade:filtered:market-quotes"),
+        redis_stream_market_trades=data.get("redis_stream_market_trades", "testrade:market-data:trades"),
+        redis_stream_filtered_market_quotes=data.get("redis_stream_filtered_market_quotes", "testrade:market-data:quotes"),
+        redis_stream_risk_actions=data.get("redis_stream_risk_actions", "testrade:risk-actions"),
+        redis_stream_position_updates=data.get("redis_stream_position_updates", "testrade:position-updates"),
+        redis_stream_enriched_position_updates=data.get("redis_stream_enriched_position_updates", "testrade:enriched-position-updates"),
+        redis_stream_internal_raw_trades=data.get("redis_stream_internal_raw_trades", "testrade:filtered:market-trades"),
+        redis_stream_internal_raw_quotes=data.get("redis_stream_internal_raw_quotes", "testrade:filtered:market-quotes"),
+        redis_stream_image_grabs=data.get("redis_stream_image_grabs", "testrade:image-grabs"),
+        redis_stream_broker_raw_messages=data.get("redis_stream_broker_raw_messages", "testrade:broker-raw-messages"),
+        redis_stream_broker_errors=data.get("redis_stream_broker_errors", "testrade:broker-errors"),
+        redis_stream_trade_lifecycle_events=data.get("redis_stream_trade_lifecycle_events", "testrade:trade-lifecycle-events"),
+        redis_stream_trading_state_changes=data.get("redis_stream_trading_state_changes", "testrade:trading-state-changes"),
+        redis_stream_config_changes=data.get("redis_stream_config_changes", "testrade:config-changes"),
+        redis_stream_maf_decisions=data.get("redis_stream_maf_decisions", "testrade:maf-decisions"),
+        redis_stream_signal_decisions=data.get("redis_stream_signal_decisions", "testrade:signal-decisions"),
+        redis_stream_execution_decisions=data.get("redis_stream_execution_decisions", "testrade:execution-decisions"),
+        redis_stream_gui_commands=data.get("redis_stream_gui_commands", "testrade:gui-commands"),
+        redis_stream_command_responses=data.get("redis_stream_command_responses", "testrade:gui-command-responses"),
+
+        # Phase 1: New Command/Response Architecture
+        redis_stream_commands_from_gui=data.get("redis_stream_commands_from_gui", "testrade:commands:from_gui"),
+        redis_stream_responses_to_gui=data.get("redis_stream_responses_to_gui", "testrade:responses:to_gui"),
+        redis_stream_core_health=data.get("redis_stream_core_health", "testrade:health:core"),
+        redis_stream_babysitter_health=data.get("redis_stream_babysitter_health", "testrade:health:babysitter"),
+        redis_stream_redis_instance_health=data.get("redis_stream_redis_instance_health", "testrade:health:redis_instance"),
+        redis_stream_ipc_alerts=data.get("redis_stream_ipc_alerts", "testrade:alerts:ipc"),
+
+        # PROJECT UNFUZZIFY: Unified timeline stream
+        redis_stream_unified_timeline=data.get("redis_stream_unified_timeline", "testrade:unified-timeline"),
+
+        # Phase 1: IPC Configuration
+        babysitter_ipc_address=data.get("babysitter_ipc_address", "tcp://127.0.0.1:5555"),
+        core_ipc_command_pull_address=data.get("core_ipc_command_pull_address", "tcp://127.0.0.1:5560"),
+        ocr_ipc_command_pull_address=data.get("ocr_ipc_command_pull_address", "tcp://127.0.0.1:5559"),
+        redis_mdfs_consumer_group=data.get("redis_mdfs_consumer_group", "mdfs-group"),
+        mdfs_redis_read_batch_count=data.get("mdfs_redis_read_batch_count", 100),
+        mdfs_redis_read_block_ms=data.get("mdfs_redis_read_block_ms", 200),
+        mdfs_redis_reconnect_delay_sec=data.get("mdfs_redis_reconnect_delay_sec", 5.0),
+        redis_publisher_threads_raw_ocr=data.get("redis_publisher_threads_raw_ocr", 1),
+        redis_publisher_threads_cleaned_ocr=data.get("redis_publisher_threads_cleaned_ocr", 1),
+        redis_publisher_threads_order_requests=data.get("redis_publisher_threads_order_requests", 1),
+        redis_publisher_threads_validated_orders=data.get("redis_publisher_threads_validated_orders", 1),
+        redis_publisher_threads_order_fills=data.get("redis_publisher_threads_order_fills", 1),
+        redis_publisher_threads_order_status=data.get("redis_publisher_threads_order_status", 1),
+        redis_publisher_threads_order_rejections=data.get("redis_publisher_threads_order_rejections", 1),
+        redis_publisher_threads_market_ticks=data.get("redis_publisher_threads_market_ticks", 1),
+        redis_publisher_threads_market_quotes=data.get("redis_publisher_threads_market_quotes", 1),
+        redis_publisher_max_retries=data.get("redis_publisher_max_retries", 3),
+        redis_publisher_retry_delay_sec=data.get("redis_publisher_retry_delay_sec", 1.0),
+
+        # <<< ADD Meltdown Config Field Assignments >>>
+        meltdown_short_window_sec=data.get("meltdown_short_window_sec", 30.0),
+        meltdown_long_window_sec=data.get("meltdown_long_window_sec", 90.0),
+        meltdown_price_drop_window=data.get("meltdown_price_drop_window", 1.5),
+        meltdown_momentum_window=data.get("meltdown_momentum_window", 3.0),
+        meltdown_heavy_sell_multiplier=data.get("meltdown_heavy_sell_multiplier", 2.5),
+        meltdown_price_drop_pct=data.get("meltdown_price_drop_pct", 0.025),
+        meltdown_consecutive_bid_hits=data.get("meltdown_consecutive_bid_hits", 3),
+        meltdown_block_multiplier=data.get("meltdown_block_multiplier", 4.0),
+        meltdown_spread_widen_factor=data.get("meltdown_spread_widen_factor", 3.0),
+        meltdown_sell_ratio_threshold=data.get("meltdown_sell_ratio_threshold", 0.85),
+        meltdown_spread_threshold_pct=data.get("meltdown_spread_threshold_pct", 0.20),
+        meltdown_halt_inactivity=data.get("meltdown_halt_inactivity", 10.0),
+        meltdown_halt_min_trades=data.get("meltdown_halt_min_trades", 5),
+
+        # Aggressive Chase Parameters for Emergency Liquidation
+        meltdown_exit_chase_attempts=data.get("meltdown_exit_chase_attempts", 3),
+        meltdown_exit_chase_delay_ms=data.get("meltdown_exit_chase_delay_ms", 300),
+        meltdown_exit_chase_aggression_cents=data.get("meltdown_exit_chase_aggression_cents", 0.02),
+
+        # New Aggressive Chase Parameters
+        meltdown_chase_max_duration_sec=data.get("meltdown_chase_max_duration_sec", 30.0),
+        meltdown_chase_peg_update_interval_sec=data.get("meltdown_chase_peg_update_interval_sec", 0.25),
+        meltdown_chase_peg_aggression_ticks=data.get("meltdown_chase_peg_aggression_ticks", 1),
+        meltdown_chase_max_slippage_percent=data.get("meltdown_chase_max_slippage_percent", 2.0),
+        meltdown_chase_use_initial_mkt=data.get("meltdown_chase_use_initial_mkt", False),
+        meltdown_chase_initial_aggression_ticks=data.get("meltdown_chase_initial_aggression_ticks", 1),
+        meltdown_chase_final_market_order=data.get("meltdown_chase_final_market_order", True),
+
+        # Chase Order State Timeout Parameters
+        CHASE_MAX_PENDING_LINK_TIME_SEC=data.get("CHASE_MAX_PENDING_LINK_TIME_SEC", 3.0),
+        CHASE_MAX_ACK_WAIT_TIME_SEC=data.get("CHASE_MAX_ACK_WAIT_TIME_SEC", 5.0),
+        # <<< End ADD >>>
+
+        # Risk Management Parameters
+        risk_min_hold_seconds=data.get("risk_min_hold_seconds", 6.0),
+        risk_catastrophic_drop_threshold=data.get("risk_catastrophic_drop_threshold", 0.10),
+        # Get the value and print it for debugging
+        risk_max_spread_pct_threshold=data.get("risk_max_spread_pct_threshold", 0.01),
+        risk_score_critical_threshold=data.get("risk_score_critical_threshold", 0.75),
+        risk_score_high_threshold=data.get("risk_score_high_threshold", 0.60),
+        risk_score_elevated_threshold=data.get("risk_score_elevated_threshold", 0.40),
+        risk_max_shares_per_trade=data.get("risk_max_shares_per_trade", 1000),
+        risk_max_notional_per_trade=data.get("risk_max_notional_per_trade", 25000.0),
+        risk_max_position_size=data.get("risk_max_position_size", 2000),
+
+        # Additional Risk Management Parameters for EventBus Order Processing
+        RISK_MAX_ORDER_QTY=data.get("RISK_MAX_ORDER_QTY", 1000),
+
+        # Task 1.3: PMD Queue Configuration
+        risk_pmd_queue_max_size=data.get("risk_pmd_queue_max_size", 500),
+        risk_pmd_workers=data.get("risk_pmd_workers", 1),
+
+        # Observability Configuration
+        observability_log_directory=data.get("observability_log_directory", "data/observability_logs"),
+
+        # Circuit Breaker Configuration
+        broker_connect_failure_threshold=data.get("broker_connect_failure_threshold", 3),
+        broker_connect_recovery_timeout_sec=data.get("broker_connect_recovery_timeout_sec", 60),
+
+        # Alpaca API Configuration
+        ALPACA_API_KEY=data.get("ALPACA_API_KEY", "PKR6DL0T0EQW14VH1GRM"),
+        ALPACA_API_SECRET=data.get("ALPACA_API_SECRET", "eAbyadtWAxVhJLxpkR50EEwrsUGY6Ue4Mnoz9WwV"),
+        ALPACA_BASE_URL=data.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
+        ALPACA_DATA_URL=data.get("ALPACA_DATA_URL", "https://data.alpaca.markets"),
+        ALPACA_USE_PAPER_TRADING=data.get("ALPACA_USE_PAPER_TRADING", False),
+        ALPACA_SIP_URL=data.get("ALPACA_SIP_URL", "wss://stream.data.alpaca.markets/v2/sip"),
+        INITIAL_SYMBOLS_ALPACA=data.get("INITIAL_SYMBOLS_ALPACA", None),
+
+        # Price fetching fallback parameters
+        price_cache_staleness_seconds_for_fallback=data.get("price_cache_staleness_seconds_for_fallback", 5.0),
+        api_fallback_min_interval_per_symbol_sec=data.get("api_fallback_min_interval_per_symbol_sec", 10.0),
+        api_fallback_max_wait_ms=data.get("api_fallback_max_wait_ms", 50.0),
+        reliable_price_buy_offset_no_quote=data.get("reliable_price_buy_offset_no_quote", 0.01),
+        reliable_price_sell_offset_no_quote=data.get("reliable_price_sell_offset_no_quote", 0.01),
+
+        # Time synchronization parameters
+        feed_latency_price_match_tolerance_cents=data.get("feed_latency_price_match_tolerance_cents", 0.01),
+
+        # New parameters for conditional late entry on suppressed opens
+        suppressed_open_retry_window_seconds=data.get("suppressed_open_retry_window_seconds", 10.0),
+        suppressed_open_price_tolerance_cents=data.get("suppressed_open_price_tolerance_cents", 0.05),
+
+        # Sync grace period to prevent premature OCR-driven closes after broker sync
+        sync_grace_period_seconds=data.get("sync_grace_period_seconds", 3.0),
+
+        # Broker position fetching timeout for liquidation
+        broker_get_positions_timeout_sec=data.get("broker_get_positions_timeout_sec", 5.0),
+
+        # For ADDs (Cost Basis absolute change)
+        cost_basis_initial_add_abs_delta_threshold=data.get("cost_basis_initial_add_abs_delta_threshold", 0.02),
+        cost_basis_settling_duration_seconds=data.get("cost_basis_settling_duration_seconds", 2.5),
+        cost_basis_settling_override_abs_delta_threshold=data.get("cost_basis_settling_override_abs_delta_threshold", 0.10),
+
+        # For REDUCEs (rPnL increase)
+        rPnL_initial_reduce_increase_threshold=data.get("rPnL_initial_reduce_increase_threshold",
+                                                       data.get("rPnL_initial_reduce_delta_threshold", 5.0)),  # Backward compatibility
+        rPnL_settling_duration_seconds=data.get("rPnL_settling_duration_seconds", 2.5),
+        rPnL_settling_override_increase_threshold=data.get("rPnL_settling_override_increase_threshold",
+                                                         data.get("rPnL_settling_override_delta_threshold", 15.0)),  # Backward compatibility
+
+        # Price-assisted override parameters
+        rPnL_settling_price_override_threshold_percent=data.get("rPnL_settling_price_override_threshold_percent", 0.5),
+        rPnL_settling_price_override_threshold_abs=data.get("rPnL_settling_price_override_threshold_abs", 0.05),
+
+        # OCR Preprocessing Parameters
+        ocr_upscale_factor=data.get("ocr_upscale_factor", 2.5),
+        ocr_force_black_text_on_white=data.get("ocr_force_black_text_on_white", True),
+        ocr_unsharp_strength=data.get("ocr_unsharp_strength", 1.8),
+        ocr_threshold_block_size=data.get("ocr_threshold_block_size", 25),
+        ocr_threshold_c=data.get("ocr_threshold_c", -3),
+        ocr_red_boost=data.get("ocr_red_boost", 1.8),
+        ocr_green_boost=data.get("ocr_green_boost", 1.8),
+
+        # OCR Symbol Enhancement Parameters
+        ocr_apply_text_mask_cleaning=data.get("ocr_apply_text_mask_cleaning", True),
+        ocr_text_mask_min_contour_area=data.get("ocr_text_mask_min_contour_area", 10),
+        ocr_text_mask_min_width=data.get("ocr_text_mask_min_width", 2),
+        ocr_text_mask_min_height=data.get("ocr_text_mask_min_height", 2),
+        ocr_enhance_small_symbols=data.get("ocr_enhance_small_symbols", True),
+        ocr_symbol_max_height=data.get("ocr_symbol_max_height", 20),
+        ocr_period_comma_ratio_min=data.get("ocr_period_comma_ratio_min", 0.5),
+        ocr_period_comma_ratio_max=data.get("ocr_period_comma_ratio_max", 1.8),
+        ocr_period_comma_radius=data.get("ocr_period_comma_radius", 3),
+        ocr_hyphen_min_ratio=data.get("ocr_hyphen_min_ratio", 1.8),
+        ocr_hyphen_min_height=data.get("ocr_hyphen_min_height", 2),
+
+        # Video input configuration
+        OCR_INPUT_VIDEO_FILE_PATH=data.get("OCR_INPUT_VIDEO_FILE_PATH", None),
+        ROI_COORDINATES=data.get("ROI_COORDINATES", None),
+        VIDEO_LOOP_ENABLED=data.get("video_loop_enabled", False),
+
+        # OCR capture timing configuration
+        ocr_capture_interval_seconds=data.get("ocr_capture_interval_seconds", 0.2),
+
+        # Tesseract configuration
+        TESSERACT_CMD=data.get("tesseract_cmd", r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+
+        # IntelliSense Configuration
+        intellisense_mode=data.get("intellisense_mode", "live"),
+        intellisense_config=data.get("intellisense_config", None),
+
+        # Recording and streaming control flags
+        enable_image_recording=data.get("enable_image_recording", False),
+        enable_raw_ocr_recording=data.get("enable_raw_ocr_recording", True),
+        enable_intellisense_logging=data.get("enable_intellisense_logging", False),
+        enable_network_diagnostics=data.get("enable_network_diagnostics", False),
+
+        # System Health Monitoring Configuration (BA20 Specification + Parallel Execution)
+        system_health_monitoring_interval_sec=data.get("system_health_monitoring_interval_sec", 2.0),
+        system_health_baseline_interval=data.get("system_health_baseline_interval", 60.0),
+        system_health_alert_cooldown_period_sec=data.get("system_health_alert_cooldown_period_sec", 300.0),
+
+        # Parallel Metric Gathering Configuration
+        system_health_metric_gather_workers=data.get("system_health_metric_gather_workers", 4),
+        system_health_metric_gather_timeout_sec=data.get("system_health_metric_gather_timeout_sec", 0.1),
+
+        # System Resource Thresholds
+        system_health_cpu_threshold=data.get("system_health_cpu_threshold", 80.0),
+        system_health_app_core_cpu_threshold=data.get("system_health_app_core_cpu_threshold", 70.0),
+        system_health_ocr_process_cpu_threshold=data.get("system_health_ocr_process_cpu_threshold", 70.0),
+        system_health_memory_threshold=data.get("system_health_memory_threshold", 85.0),
+        system_health_disk_threshold=data.get("system_health_disk_threshold", 90.0),
+
+        # OCR Subsystem Health Thresholds
+        system_health_ocr_process_max_cpu_percent=data.get("system_health_ocr_process_max_cpu_percent", 90.0),
+        system_health_ocr_conditioning_max_q_size=data.get("system_health_ocr_conditioning_max_q_size", 150),
+
+        # EventBus Health Thresholds
+        system_health_event_bus_max_queue_size=data.get("system_health_event_bus_max_queue_size", 5000),
+        system_health_event_bus_max_avg_processing_ms=data.get("system_health_event_bus_max_avg_processing_ms", 100),
+
+        # Risk Service Health Thresholds
+        system_health_risk_max_latency_p95_ms=data.get("system_health_risk_max_latency_p95_ms", 200),
+        system_health_risk_max_pmd_queue_size=data.get("system_health_risk_max_pmd_queue_size", 100),
+
+        # Market Data Pipeline Health Thresholds
+        system_health_market_data_mmap_max_fill_pct=data.get("system_health_market_data_mmap_max_fill_pct", 90.0),
+        system_health_market_data_bulk_channel_clogged_duration_sec=data.get("system_health_market_data_bulk_channel_clogged_duration_sec", 60),
+
+        enable_internal_market_data_streaming=data.get("enable_internal_market_data_streaming", True),
+        ENABLE_IPC_DATA_DUMP=data.get("ENABLE_IPC_DATA_DUMP", True),
+        FEATURE_FLAG_GUI_USE_XREAD_AND_BOOTSTRAP_API=data.get("FEATURE_FLAG_GUI_USE_XREAD_AND_BOOTSTRAP_API", False),
+        development_mode=data.get("development_mode", True),
+
+        flicker_filter=ff_params
+    )
+
+# --- MODIFIED & FILLED: _publish_config_change_event ---
+def _publish_config_change_event(
+    ipc_client: Optional[IBulletproofBabysitterIPCClient],
+    full_config_dict_snapshot: Optional[Dict[str, Any]], # Full snapshot (for bootstrap/save) or None (for update_key delta)
+    changed_params_details: Optional[Dict[str, Any]], # Dict like {"param_name": {"old": X, "new": Y}}
+    change_source: str,
+    change_method: str,
+    config_stream_name: str,
+    # Removed logger_instance, will use _module_logger
+    system_version_tag: Optional[str] = "TESTRADE_v_unknown" # Added for bootstrap consistency
+    ):
+    """
+    Publishes config change events to the specified Redis stream via the IPC client.
+    """
+    if not (ipc_client and not ipc_client.offline_mode):
+        _module_logger.debug(f"Config change event not published: IPC client unavailable or offline. Source: {change_source}")
+        return
+
+    # Ensure _create_redis_message_json is accessible, typically from ApplicationCore instance
+    # For global_config, if direct app_core access is problematic, this helper needs to be robust
+    # or the ipc_client itself should handle message wrapping.
+    # For MVP, assume the caller of save/update_config (which provides ipc_client) ensures
+    # that the _create_redis_message_json mechanism is implicitly handled by the ipc_client
+    # or that ApplicationCore provides a global way to access it.
+    # The BulletproofBabysitterIPCClient does NOT have _create_redis_message_json.
+    # This is a slight design challenge for this module-level function.
+
+    # Simplest solution: ApplicationCore._instance._create_redis_message_json
+    # This creates a direct dependency but is pragmatic for module-level functions.
+    # Requires ApplicationCore to have _instance set and accessible.
+    _create_msg_json_func = None
+    try:
+        from utils.redis_utils import create_redis_message_json # Import directly
+        _create_msg_json_func = create_redis_message_json
+    except ImportError:
+        _module_logger.error("Cannot publish config change: Failed to import create_redis_message_json from utils.redis_utils.")
+        return
+
+    try:
+        event_timestamp = time.time()
+        payload_data = {
+            # Per detailed design Stream 1: Payload Schema (for config-changes)
+            # "metadata" is part of the outer wrapper from _create_redis_message_json
+            # The "payload" key here refers to the inner payload for the TESTRADE_CONFIG_CHANGE/BOOTSTRAP event
+            "full_config_snapshot": full_config_dict_snapshot, # This is the direct content of control.json
+            "change_details": {
+                # Legacy fields - robust handling for empty/None changed_params_details
+                "changed_parameter": "MULTIPLE_OR_NONE",  # Default value
+                "old_value": None,  # Default value
+                "new_value": None,  # Default value
+                # More structured change details:
+                "specific_changes": changed_params_details, # e.g., {"param1": {"old":1, "new":2}, "param2": {"old":'a', "new":'b'}}
+                "change_source": change_source, # "gui_update", "api_call", "system_bootstrap", etc.
+                "change_timestamp": event_timestamp, # Timestamp of the change event itself
+                "change_method": change_method # "save_global_config", "update_config_key", "application_startup"
+            }
+        }
+
+        # Safely populate legacy fields if there's exactly one change
+        if changed_params_details and len(changed_params_details) == 1:
+            try:
+                param_name = list(changed_params_details.keys())[0]
+                param_change = list(changed_params_details.values())[0]
+
+                payload_data["change_details"]["changed_parameter"] = param_name
+                if isinstance(param_change, dict):
+                    payload_data["change_details"]["old_value"] = param_change.get('old')
+                    payload_data["change_details"]["new_value"] = param_change.get('new')
+            except (IndexError, KeyError, TypeError) as e:
+                # Keep defaults if any error occurs during legacy field population
+                _module_logger.debug(f"Could not populate legacy fields for single change: {e}")
+
+        # Determine event_type based on whether it's a full snapshot or delta
+        # This aligns with payload in detailed design for 'testrade:config-changes' stream
+        # and differentiates bootstrap/full save from single key updates.
+        if change_method == "application_startup": # This specific method indicates bootstrap
+            event_type = "TESTRADE_CONFIG_BOOTSTRAP"
+            # Add system_version and bootstrap_reason for bootstrap events, as per design
+            payload_data["change_details"]["system_version"] = system_version_tag
+            payload_data["change_details"]["bootstrap_reason"] = "application_core_initialization_complete"
+        else:
+            event_type = "TESTRADE_CONFIG_CHANGE" # General change event for save/update
+
+        from utils.thread_safe_uuid import get_thread_safe_uuid
+        correlation_id = f"config_{change_method}_{get_thread_safe_uuid()[:12]}"
+
+        redis_message_json_str = _create_msg_json_func(
+            payload=payload_data, # This is the inner payload for the stream event
+            event_type_str=event_type,
+            correlation_id_val=correlation_id,
+            source_component_name=f"GlobalConfig.{change_source}" # More specific source
+        )
+
+        # Always send if IPC client is available (NullCorrelationLogger pattern handles telemetry control)
+        success = ipc_client.send_data(
+            target_redis_stream=config_stream_name,
+            data_json_string=redis_message_json_str,
+            explicit_socket_type='system'
+        )
+
+        if success:
+            _module_logger.info(f"Config event '{event_type}' published to '{config_stream_name}'. Source: {change_source}, Method: {change_method}. CorrID: {correlation_id}")
+        else:
+            _module_logger.warning(f"Failed to publish config event '{event_type}' to '{config_stream_name}'. May be buffered. CorrID: {correlation_id}")
+
+    except Exception as e:
+        _module_logger.error(f"Error in _publish_config_change_event: {e}", exc_info=True)
+
+
+# --- MODIFIED: save_global_config ---
+def save_global_config(cfg: GlobalConfig,
+                       custom_path: Optional[str] = None,
+                       ipc_client: Optional[IBulletproofBabysitterIPCClient] = None,
+                       change_source_override: Optional[str] = None,
+                       telemetry_service = None,
+                       correlation_id: Optional[str] = None
+                       ) -> None:
+    global config # The current in-memory global config (represents "old" state before this save)
+    path_to_save = custom_path or CONFIG_FILE_PATH
+    # _module_logger is already defined at module level
+
+    new_config_data_to_save = {}
+    try:
+        new_config_data_to_save = asdict(cfg) # cfg is the NEW state to be saved
+        if isinstance(cfg.flicker_filter, FlickerFilterParams): # Ensure nested dataclasses are dicts
+            new_config_data_to_save['flicker_filter'] = asdict(cfg.flicker_filter)
+    except Exception as e_asdict:
+        _module_logger.error(f"Error converting NEW GlobalConfig to dict for saving: {e_asdict}. Config save may be incomplete.")
+        # Fallback to manual conversion for robustness if asdict fails
+        new_config_data_to_save = {key: getattr(cfg, key) for key in cfg.__annotations__ if hasattr(cfg,key)}
+        if 'flicker_filter' in new_config_data_to_save and isinstance(new_config_data_to_save['flicker_filter'], FlickerFilterParams):
+             new_config_data_to_save['flicker_filter'] = asdict(new_config_data_to_save['flicker_filter'])
+
+    # Publishing logic - BEFORE reloading global config, using 'config' as old state
+    
+    # NEW: Enhanced config change publishing via TelemetryService
+    if telemetry_service:
+        try:
+            old_config_dict_for_telemetry = {}
+            try:
+                old_config_dict_for_telemetry = asdict(config)  # Current global config as "old" state
+                if isinstance(config.flicker_filter, FlickerFilterParams):
+                    old_config_dict_for_telemetry['flicker_filter'] = asdict(config.flicker_filter)
+            except Exception as e_asdict_old:
+                _module_logger.warning(f"Could not convert current config to dict for telemetry diff: {e_asdict_old}")
+            
+            if old_config_dict_for_telemetry:
+                source = change_source_override or "save_global_config"
+                publish_config_change_via_telemetry(
+                    telemetry_service=telemetry_service,
+                    old_config_dict=old_config_dict_for_telemetry,
+                    new_config_dict=new_config_data_to_save,
+                    change_source=source,
+                    correlation_id=correlation_id
+                )
+        except Exception as e_telemetry:
+            _module_logger.error(f"Error during telemetry config change publishing: {e_telemetry}", exc_info=True)
+    
+    # LEGACY: Original IPC-based publishing (maintained for compatibility)
+    if ipc_client:
+        try:
+            old_config_dict_for_diff = {}
+            try:
+                old_config_dict_for_diff = asdict(config) # 'config' is the current global "old" state
+                if isinstance(config.flicker_filter, FlickerFilterParams):
+                    old_config_dict_for_diff['flicker_filter'] = asdict(config.flicker_filter)
+            except Exception as e_asdict_old:
+                 _module_logger.warning(f"Could not convert current global 'config' to dict for diff: {e_asdict_old}")
+
+
+            changed_details_for_publish = {}
+            if old_config_dict_for_diff: # Only diff if we have the old state
+                for key, new_val in new_config_data_to_save.items():
+                    old_val = old_config_dict_for_diff.get(key)
+                    if old_val != new_val: # This comparison can be tricky for complex objects/floats
+                        # For nested dicts like flicker_filter, ensure deep comparison if needed
+                        # For simplicity, direct comparison here. More robust diffing might be needed for complex cases.
+                        changed_details_for_publish[key] = {"old": old_val, "new": new_val}
+
+            source = change_source_override or "save_global_config_call" # More generic source
+            # Use stream name from the NEW config being saved (cfg)
+            config_stream = getattr(cfg, 'redis_stream_config_changes', 'testrade:config-changes')
+
+            _publish_config_change_event(
+                ipc_client=ipc_client,
+                full_config_dict_snapshot=new_config_data_to_save, # Send the NEW config as the snapshot
+                changed_params_details=changed_details_for_publish if changed_details_for_publish else None,
+                change_source=source,
+                change_method="save_global_config",
+                config_stream_name=config_stream
+            )
+        except Exception as e_pub:
+            _module_logger.error(f"Error during config change publishing in save_global_config: {e_pub}", exc_info=True)
+
+    try:
+        os.makedirs(os.path.dirname(path_to_save), exist_ok=True)  # Ensure directory exists
+        with open(path_to_save, "w") as f:
+            json.dump(new_config_data_to_save, f, indent=2) # Save the new data
+            f.flush()  # Ensure data is written to disk
+            os.fsync(f.fileno())  # Force OS to write to disk
+        _module_logger.info(f"Successfully saved config to {path_to_save}")
+
+        # Add small delay to prevent race condition with file system
+        import time
+        time.sleep(0.01)  # 10ms delay to ensure file is fully written
+
+        # Automatically reload the global 'config' from the path we just saved to
+        reload_global_config(custom_path=path_to_save)  # Pass the same path
+    except Exception as e:
+        _module_logger.error(f"Error saving or reloading config at {path_to_save}: {e}", exc_info=True)
+
+# ------------------------------------------------------------------------------
+# Create a TOP-LEVEL INSTANCE so other modules can do:
+# "from utils.global_config import config"
+# ------------------------------------------------------------------------------
+# Define path once for consistency
+CONFIG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control.json")
+
+try:
+    config = load_global_config_legacy(CONFIG_FILE_PATH)
+    # Add a log after initial load
+    _module_logger = logging.getLogger(__name__)  # Use module logger for this
+    _module_logger.info(f"Initial global config loaded from {CONFIG_FILE_PATH}. risk_max_spread_pct_threshold = {config.risk_max_spread_pct_threshold}")
+except FileNotFoundError:
+    _module_logger = logging.getLogger(__name__)
+    _module_logger.error(f"CRITICAL: {CONFIG_FILE_PATH} not found! Using default GlobalConfig values.")
+    config = GlobalConfig()
+except Exception as e:
+    _module_logger = logging.getLogger(__name__)
+    _module_logger.error(f"CRITICAL: Error loading {CONFIG_FILE_PATH}: {e}. Using default GlobalConfig values.", exc_info=True)
+    config = GlobalConfig()
+
+
+# --- MODIFIED: update_config_key ---
+def update_config_key(key: str, value: any,
+                      custom_path: Optional[str] = None,
+                      ipc_client: Optional[IBulletproofBabysitterIPCClient] = None, # ADDED
+                      change_source_override: Optional[str] = None # ADDED
+                      ) -> bool:
+    """
+    Selectively update a single key in the control.json file without overwriting other values.
+    This is a safe alternative to save_global_config() for individual parameter updates.
+
+    Args:
+        key: The configuration key to update
+        value: The new value for the key
+        custom_path: Optional custom path to the config file
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    global config # The current in-memory global config
+    path_to_update = custom_path or CONFIG_FILE_PATH
+    # _module_logger is already defined at module level
+
+    old_value_for_publish = "COULD_NOT_RETRIEVE_OLD_VALUE" # Default placeholder
+    current_obj_for_old_val = config
+    keys_for_old_val = key.split('.')
+    try:
+        for k_part in keys_for_old_val[:-1]:
+            current_obj_for_old_val = getattr(current_obj_for_old_val, k_part)
+        old_value_for_publish = getattr(current_obj_for_old_val, keys_for_old_val[-1])
+        if hasattr(old_value_for_publish, '__dataclass_fields__'): # If it's a dataclass
+            old_value_for_publish = asdict(old_value_for_publish)
+    except AttributeError:
+        _module_logger.warning(f"Could not retrieve old value for nested key '{key}' from in-memory config for publishing.")
+
+
+    # Publishing logic - BEFORE updating in-memory config or file
+    if ipc_client:
+        try:
+            source = change_source_override
+            if not source:
+                try:
+                    source = inspect.stack()[1].function # Caller function name
+                except IndexError:
+                    source = "update_config_key_direct_call"
+
+            config_stream = getattr(config, 'redis_stream_config_changes', 'testrade:config-changes') # Use current config for stream name
+
+            changed_details_for_publish = {key: {"old": old_value_for_publish, "new": value}}
+
+            _publish_config_change_event(
+                ipc_client=ipc_client,
+                full_config_dict_snapshot=None, # DELTA: Send None for full snapshot
+                changed_params_details=changed_details_for_publish,
+                change_source=source,
+                change_method="update_config_key",
+                config_stream_name=config_stream
+            )
+        except Exception as e_pub:
+            _module_logger.error(f"Error during config change publishing in update_config_key for key '{key}': {e_pub}", exc_info=True)
+
+    # Existing file update and in-memory update logic
+    try:
+        with open(path_to_update, "r") as f:
+            existing_data = json.load(f)
+
+        d = existing_data
+        keys_to_update = key.split('.')
+        for k_part in keys_to_update[:-1]:
+            d = d.setdefault(k_part, {})
+        d[keys_to_update[-1]] = value
+
+        os.makedirs(os.path.dirname(path_to_update), exist_ok=True)
+        with open(path_to_update, "w") as f:
+            json.dump(existing_data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        obj_to_update_in_memory = config
+        for k_part in keys_to_update[:-1]:
+            obj_to_update_in_memory = getattr(obj_to_update_in_memory, k_part)
+        setattr(obj_to_update_in_memory, keys_to_update[-1], value)
+
+        _module_logger.info(f"Successfully updated config key '{key}' to '{value}' in {path_to_update} and in-memory.")
+        return True
+
+    except FileNotFoundError:
+        _module_logger.error(f"Config file not found: {path_to_update}")
+        return False
+    except json.JSONDecodeError as e:
+        _module_logger.error(f"Invalid JSON in config file {path_to_update}: {e}")
+        return False
+    except Exception as e:
+        _module_logger.error(f"Error updating config key '{key}' in {path_to_update}: {e}", exc_info=True)
+        return False
+
+
+def reload_global_config(
+    custom_path: Optional[str] = None,
+    ipc_client: Optional[IBulletproofBabysitterIPCClient] = None,
+    change_source_override: Optional[str] = None
+) -> None:
+    """
+    Explicitly reloads global 'config' from the specified path, calculates a diff
+    against the current in-memory config, and publishes a change event if differences are found.
+    """
+    global config  # We are modifying the global 'config' instance
+    path_to_load = custom_path or CONFIG_FILE_PATH
+    _module_logger = logging.getLogger(__name__)
+
+    try:
+        # --- NEW LOGIC: Diff and Publish ---
+        # 1. Capture the "old" state from the current in-memory config
+        old_config_dict = asdict(config)
+
+        # 2. Load the "new" state from the file
+        new_config = load_global_config_legacy(path_to_load)
+        new_config_dict = asdict(new_config)
+
+        # 3. Calculate the diff
+        changed_params = {}
+        for key, new_value in new_config_dict.items():
+            old_value = old_config_dict.get(key)
+            if old_value != new_value:
+                changed_params[key] = {"old": old_value, "new": new_value}
+
+        # 4. Publish the diff event if there are changes and an IPC client is provided
+        if changed_params and ipc_client:
+            source = change_source_override or "hot_reload_from_disk"
+            _module_logger.info(f"Hot reload detected {len(changed_params)} changes. Publishing event...")
+            _publish_config_change_event(
+                ipc_client=ipc_client,
+                full_config_dict_snapshot=new_config_dict, # Send the new full state
+                changed_params_details=changed_params,
+                change_source=source,
+                change_method="reload_global_config",
+                config_stream_name=new_config.redis_stream_config_changes
+            )
+        
+        # 5. Finally, update the global config instance to the new state
+        config = new_config
+        _module_logger.info(f"Global config successfully reloaded from {path_to_load}. Active changes: {list(changed_params.keys()) if changed_params else 'None'}")
+
+    except Exception as e:
+        _module_logger.error(f"Error during intelligent reload of config from {path_to_load}: {e}", exc_info=True)

@@ -1,0 +1,34 @@
+{
+  "ROI_COORDINATES": [
+    64,
+    159,
+    681,
+    296
+  ],
+  "opencv_threads": 1,
+  "opencv_optimized": 1,
+  "opencv_log_level": "warning",
+  "ocr_upscale_factor": 3.0,
+  "ocr_force_black_text_on_white": true,
+  "ocr_unsharp_strength": 1.7,
+  "ocr_threshold_block_size": 25,
+  "ocr_threshold_c": -6,
+  "ocr_red_boost": 1.0,
+  "ocr_green_boost": 1.0,
+  "ocr_apply_text_mask_cleaning": 1,
+  "ocr_text_mask_min_contour_area": 5,
+  "ocr_text_mask_min_width": 2,
+  "ocr_text_mask_min_height": 1,
+  "ocr_enhance_small_symbols": 1,
+  "ocr_symbol_max_height": 10,
+  "ocr_period_comma_ratio_min": 0.2,
+  "ocr_period_comma_ratio_max": 1.2,
+  "ocr_period_comma_radius": 5,
+  "ocr_hyphen_min_ratio": 3,
+  "ocr_hyphen_min_height": 3
+  ,
+  "REDIS_HOST": "localhost",
+  "REDIS_PORT": 6379,
+  "REDIS_DB": 0,
+  "REDIS_PASSWORD": null
+}

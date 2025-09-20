@@ -1,0 +1,91 @@
+{
+  "mission_control_distributed": {
+    "architecture": "DISTRIBUTED",
+    "machines": {
+      "BEAST": {
+        "ip": "192.168.50.100",
+        "role": "TRADING_ENGINE",
+        "platform": "windows",
+        "services": {
+          "Main": {
+            "display_name": "Trading Engine",
+            "local": true
+          },
+          "OCRProcess": {
+            "display_name": "OCR Accelerator",
+            "local": true
+          }
+        }
+      },
+      "TELEMETRY": {
+        "ip": "192.168.50.101",
+        "role": "TELEMETRY_HUB",
+        "platform": "linux",
+        "services": {
+          "Redis": {
+            "display_name": "Redis Server",
+            "command": ["redis-server"],
+            "check_command": ["redis-cli", "ping"],
+            "local": true
+          },
+          "TelemetryService": {
+            "display_name": "Telemetry Service",
+            "command": ["python3", "/home/telemetry/telemetry-hub/services/telemetry/telemetry_service_dual_mode.py"],
+            "cwd": "/home/telemetry/telemetry-hub",
+            "local": true
+          },
+          "BabysitterService": {
+            "display_name": "Babysitter Service",
+            "command": ["python3", "/home/telemetry/telemetry-hub/services/babysitter/babysitter_service.py"],
+            "cwd": "/home/telemetry/telemetry-hub",
+            "local": true
+          },
+          "GUIBackend": {
+            "display_name": "GUI Backend",
+            "command": ["python3", "/home/telemetry/telemetry-hub/services/gui/run_gui_backend.py"],
+            "cwd": "/home/telemetry/telemetry-hub",
+            "local": true,
+            "health_check": "http://localhost:8001/health"
+          }
+        }
+      }
+    },
+    "mode_configurations": {
+      "DISTRIBUTED_LIVE": {
+        "description": "Distributed live trading across BEAST and TELEMETRY",
+        "beast_services": ["Main", "OCRProcess"],
+        "telemetry_services": ["Redis", "TelemetryService", "BabysitterService", "GUIBackend"],
+        "config_updates": {
+          "enable_intellisense_logging": true,
+          "ENABLE_IPC_DATA_DUMP": true,
+          "TELEMETRY_BULK_ENDPOINT": "tcp://telemetry-hub:5555",
+          "TELEMETRY_TRADING_ENDPOINT": "tcp://telemetry-hub:5556",
+          "TELEMETRY_SYSTEM_ENDPOINT": "tcp://telemetry-hub:5557"
+        }
+      },
+      "DISTRIBUTED_TANK": {
+        "description": "Distributed testing mode",
+        "beast_services": ["Main", "OCRProcess"],
+        "telemetry_services": ["Redis", "TelemetryService", "BabysitterService", "GUIBackend"],
+        "config_updates": {
+          "enable_intellisense_logging": true,
+          "ENABLE_IPC_DATA_DUMP": true,
+          "disable_broker": true,
+          "development_mode": true
+        }
+      }
+    },
+    "startup_sequence": {
+      "telemetry_first": [
+        {"machine": "TELEMETRY", "service": "Redis", "wait": 3},
+        {"machine": "TELEMETRY", "service": "BabysitterService", "wait": 2},
+        {"machine": "TELEMETRY", "service": "TelemetryService", "wait": 2},
+        {"machine": "TELEMETRY", "service": "GUIBackend", "wait": 2}
+      ],
+      "then_beast": [
+        {"machine": "BEAST", "service": "Main", "wait": 5},
+        {"machine": "BEAST", "service": "OCRProcess", "wait": 2}
+      ]
+    }
+  }
+}

@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+Knowledge Base Query Tool - Simple, fast access to what you need
+"""
+import sqlite3
+import sys
+import os
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'knowledge.db')
+
+def connect():
+    return sqlite3.connect(DB_PATH)
+
+def show_current():
+    """Show current state - default action"""
+    conn = connect()
+    c = conn.cursor()
+    
+    # Current state
+    row = c.execute("SELECT task_description, status, blocking_issue, next_action, project_context FROM current_state ORDER BY last_updated DESC LIMIT 1").fetchone()
+    if row:
+        print(f"📍 CURRENT: {row[0]}")
+        print(f"   Status: {row[1]}")
+        if row[2]:
+            print(f"   ⚠️  Blocked: {row[2]}")
+        if row[4]:  # Project context
+            print(f"\n📖 CONTEXT: {row[4]}")
+        if row[3]:
+            print(f"\n🎯 NEXT ACTION:")
+            print(f"   $ {row[3]}")
+    
+    # Show active projects
+    projects = c.execute("SELECT name, success_criteria FROM projects WHERE status IN ('active', 'planned') ORDER BY priority LIMIT 2").fetchall()
+    if projects:
+        print("\n📋 ACTIVE PROJECTS:")
+        for proj in projects:
+            print(f"   • {proj[0]}: {proj[1]}")
+    
+    # Show critical facts if any from last 7 days
+    facts = c.execute("SELECT fact FROM critical_facts WHERE added_date >= date('now', '-7 days') LIMIT 3").fetchall()
+    if facts:
+        print("\n⚡ REMEMBER:")
+        for fact in facts:
+            print(f"   • {fact[0]}")
+    
+    conn.close()
+
+def query_machines(args):
+    """Query machine information"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("🖥️  MACHINES:")
+        for row in c.execute("SELECT name, ssh_command, role, os FROM machines"):
+            print(f"  {row[0]:12} {row[1]:20} [{row[2]}] {row[3]}")
+    else:
+        machine = args[0]
+        row = c.execute("SELECT * FROM machines WHERE name = ?", (machine,)).fetchone()
+        if row:
+            print(f"Machine: {row[0]}")
+            print(f"  SSH: {row[3]}")
+            print(f"  Role: {row[4]}")
+            print(f"  OS: {row[5]}")
+            print(f"  Python: {row[6]}")
+            print(f"  Paths: {row[7]}")
+    
+    conn.close()
+
+def query_files(args):
+    """Query file locations"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("📁 FILES:")
+        for row in c.execute("SELECT component, file_name, current_location, status FROM files"):
+            status_icon = "✓" if row[3] == "WORKING" else "✗" if row[3] == "BROKEN" else "🔧"
+            print(f"  {status_icon} {row[0]}/{row[1]}: {row[2]}")
+    else:
+        component = args[0]
+        for row in c.execute("SELECT * FROM files WHERE component = ?", (component,)):
+            print(f"{row[1]}:")
+            print(f"  Current: {row[3]}")
+            print(f"  Status: {row[4]}")
+            if row[7]:
+                print(f"  Note: {row[7]}")
+    
+    conn.close()
+
+def query_errors(args):
+    """Query error solutions"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("❌ COMMON ERRORS:")
+        for row in c.execute("SELECT error_message FROM errors"):
+            print(f"  • {row[0][:60]}...")
+    else:
+        search = ' '.join(args)
+        rows = c.execute("SELECT * FROM errors WHERE error_message LIKE ?", (f'%{search}%',)).fetchall()
+        for row in rows:
+            print(f"ERROR: {row[1]}")
+            print(f"  Cause: {row[3]}")
+            print(f"  Solution: {row[4]}")
+            if row[5]:
+                print(f"  Fix: {row[5]}")
+    
+    conn.close()
+
+def query_never():
+    """Query things to never do"""
+    conn = connect()
+    c = conn.cursor()
+    
+    print("⛔ NEVER DO:")
+    for row in c.execute("SELECT category, bad_action, correct_action FROM never_do"):
+        print(f"  [{row[0]}] NEVER {row[1]}")
+        print(f"         → {row[2]}")
+    
+    conn.close()
+
+def query_command(args):
+    """Get specific command"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("🔧 COMMANDS:")
+        for row in c.execute("SELECT name, description FROM commands ORDER BY category, order_num"):
+            print(f"  {row[0]:20} {row[1]}")
+    else:
+        name = args[0]
+        row = c.execute("SELECT * FROM commands WHERE name = ?", (name,)).fetchone()
+        if row:
+            print(f"{row[2]}:")
+            print(f"  $ {row[3]}")
+            if row[4]:
+                print(f"  Prerequisites: {row[4]}")
+    
+    conn.close()
+
+def query_build():
+    """Show build configuration"""
+    conn = connect()
+    c = conn.cursor()
+    
+    row = c.execute("SELECT * FROM build_config WHERE component = 'ocr'").fetchone()
+    if row:
+        print("🔨 BUILD CONFIG (OCR):")
+        print(f"  Python: {row[1]} at {row[2]}")
+        print(f"  Compiler: {row[3]}")
+        print(f"  Dependencies: {row[4]}")
+        print(f"  Script: {row[5]}")
+        print(f"  Directory: {row[6]}")
+    
+    conn.close()
+
+def query_env(args):
+    """Query environment settings"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("🌍 ENVIRONMENT SETTINGS:")
+        for row in c.execute("SELECT component, setting, value FROM environment ORDER BY component"):
+            print(f"  {row[0]:10} {row[1]:15} = {row[2]}")
+    else:
+        component = args[0]
+        for row in c.execute("SELECT * FROM environment WHERE component = ?", (component,)):
+            print(f"{row[1]}.{row[2]} = {row[3]}")
+            if row[4]:
+                print(f"  Verify: {row[4]}")
+            if row[5]:
+                print(f"  Notes: {row[5]}")
+    
+    conn.close()
+
+def query_paths():
+    """Query common paths"""
+    conn = connect()
+    c = conn.cursor()
+    
+    print("📁 COMMON PATHS:")
+    for row in c.execute("SELECT name, path, machine, description FROM common_paths"):
+        print(f"  {row[0]:15} → {row[1]:40} [{row[2]}]")
+        if row[3]:
+            print(f"                    {row[3]}")
+    
+    conn.close()
+
+def query_deps(args):
+    """Query dependencies"""
+    conn = connect()
+    c = conn.cursor()
+    
+    if not args:
+        print("📦 DEPENDENCIES:")
+        for row in c.execute("SELECT DISTINCT component, depends_on, version FROM dependencies"):
+            print(f"  {row[0]:10} needs {row[1]:15} ({row[2]})")
+    else:
+        component = args[0]
+        print(f"📦 {component} DEPENDENCIES:")
+        for row in c.execute("SELECT * FROM dependencies WHERE component = ?", (component,)):
+            print(f"  • {row[1]} ({row[2]})")
+            print(f"    Install: {row[3]}")
+            print(f"    Verify:  {row[4]}")
+    
+    conn.close()
+
+def query_handoff():
+    """Show session handoff info"""
+    conn = connect()
+    c = conn.cursor()
+    
+    row = c.execute("SELECT * FROM session_handoff ORDER BY timestamp DESC LIMIT 1").fetchone()
+    if row:
+        print("🤝 SESSION HANDOFF:")
+        print(f"  Left off: {row[1]}")
+        print(f"  Waiting for: {row[2]}")
+        print(f"  Next steps: {row[3]}")
+        if row[4]:
+            print(f"  Temp files: {row[4]}")
+    
+    conn.close()
+
+def query_hot():
+    """Show hot areas - recent changes and active work"""
+    conn = connect()
+    c = conn.cursor()
+    
+    print("🔥 HOT AREAS:")
+    
+    # Recent changes from current_state
+    row = c.execute("SELECT recent_changes FROM current_state LIMIT 1").fetchone()
+    if row and row[0]:
+        print(f"\n📝 Recent changes:")
+        print(f"  {row[0]}")
+    
+    # Active/blocked work
+    row = c.execute("SELECT task_description, status, blocking_issue FROM current_state LIMIT 1").fetchone()
+    if row:
+        print(f"\n🎯 Current task: {row[0]}")
+        print(f"  Status: {row[1]}")
+        if row[2]:
+            print(f"  ⚠️  BLOCKED: {row[2]}")
+    
+    # Broken files
+    broken = c.execute("SELECT file_name, component FROM files WHERE status='BROKEN'").fetchall()
+    if broken:
+        print("\n❌ Broken files:")
+        for f in broken:
+            print(f"  • {f[1]}/{f[0]}")
+    
+    # Recent errors (last 24h would need timestamp)
+    errors = c.execute("SELECT error_message FROM errors ORDER BY rowid DESC LIMIT 3").fetchall()
+    if errors:
+        print("\n⚡ Recent errors:")
+        for e in errors[:2]:
+            print(f"  • {e[0][:60]}...")
+    
+    conn.close()
+
+def run_sql(query):
+    """Run arbitrary SQL query"""
+    conn = connect()
+    c = conn.cursor()
+    
+    try:
+        c.execute(query)
+        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER')):
+            conn.commit()
+            print(f"Query executed and committed. Rows affected: {c.rowcount}")
+        else:
+            for row in c.fetchall():
+                print(row)
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    conn.close()
+
+def show_help():
+    print("""
+TESTRADE Knowledge Base Query Tool
+==================================
+
+USAGE: kb [command] [args]
+
+COMMANDS:
+  (none)         Show current state and next actions
+  machines       List all machines (or details: kb machines beast)
+  files          List all files (or by component: kb files ocr)
+  errors [text]  Search error solutions
+  never          Show critical things to never do
+  cmd [name]     Get specific command
+  build          Show build configuration
+  env            Show environment settings
+  paths          Show common paths
+  deps           Show dependencies
+  handoff        Show session handoff info
+  hot            Show hot areas (recent changes, active work)
+  sql "query"    Run SQL query
+  
+EXAMPLES:
+  kb                        # What am I doing?
+  kb machines beast         # How to connect to BEAST
+  kb files ocr             # Where are OCR files?
+  kb errors tessdata       # How to fix tessdata error
+  kb cmd ocr_rebuild       # Get rebuild command
+  kb paths                  # Where are things located?
+  kb deps TANK             # What does TANK need?
+  kb hot                    # What's happening now?
+  kb sql "SELECT * FROM current_state"
+""")
+
+def main():
+    if len(sys.argv) < 2:
+        show_current()
+        return
+    
+    command = sys.argv[1]
+    args = sys.argv[2:] if len(sys.argv) > 2 else []
+    
+    if command in ['help', '-h', '--help']:
+        show_help()
+    elif command == 'machines':
+        query_machines(args)
+    elif command == 'files':
+        query_files(args)
+    elif command == 'errors':
+        query_errors(args)
+    elif command == 'never':
+        query_never()
+    elif command == 'cmd':
+        query_command(args)
+    elif command == 'build':
+        query_build()
+    elif command == 'env':
+        query_env(args)
+    elif command == 'paths':
+        query_paths()
+    elif command == 'deps':
+        query_deps(args)
+    elif command == 'handoff':
+        query_handoff()
+    elif command == 'hot':
+        query_hot()
+    elif command == 'sql':
+        if args:
+            run_sql(' '.join(args))
+        else:
+            print("Usage: kb sql \"SELECT * FROM table\"")
+    else:
+        # Try as command name
+        query_command([command])
+
+if __name__ == '__main__':
+    main()

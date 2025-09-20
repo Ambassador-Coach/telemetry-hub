@@ -1,0 +1,696 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TESTRADE - IntelliSense Trading Platform</title>
+    <link rel="stylesheet" href="/static/styles.css">
+
+    <!-- Feature Flag Configuration - Injected by Backend -->
+    <script>
+        // This will be populated by the backend when serving the HTML
+        // For development, defaults to true (Bootstrap + XREAD mode)
+        var global_app_config = {
+            FEATURE_FLAG_GUI_USE_XREAD_AND_BOOTSTRAP_API: true
+        };
+    </script>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div class="logo-section">
+            <div class="logo">TESTRADE</div>
+            <div class="intellisense-badge">IntelliSense AI</div>
+        </div>
+        <div class="status-indicators">
+            <div class="status-pill">
+                <div class="status-dot" id="apiStatusDot" style="background: var(--accent-danger);"></div> <!-- Default to disconnected -->
+                <span>API</span>
+            </div>
+            <div class="status-pill">
+                <div class="status-dot" id="coreStatusDot" style="background: var(--accent-danger);"></div> <!-- Default to disconnected -->
+                <span>Core</span>
+            </div>
+            <div class="status-pill">
+                <div class="status-dot" id="redisStatusDot" style="background: var(--accent-danger);"></div>
+                <span>Redis</span>
+            </div>
+            <div class="status-pill">
+                <div class="status-dot" id="babysitterStatusDot" style="background: var(--accent-danger);"></div>
+                <span>Babysitter</span>
+            </div>
+
+            <div class="status-pill">
+                <div class="status-dot" id="zmqStatusDot" style="background: var(--text-muted);"></div>
+                <span>ZMQ</span>
+            </div>
+            <div class="status-pill">
+                <span id="latencyDisplay">--ms</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="main-container">
+        <!-- Content Area -->
+        <div class="content-area">
+            <!-- Main Content - Stacked -->
+            <div class="main-content">
+                <!-- OCR Preview Panel -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">OCR Preview</div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <button class="btn" style="font-size: 8px; padding: 4px 8px;" id="imageModeToggle">Raw</button>
+                            <span style="font-size: 9px; color: var(--accent-primary);"> Live</span>
+                        </div>
+                    </div>
+                    <div class="panel-content">
+                        <!-- ROI Controls Layout: Buttons Around Image -->
+                        <div class="roi-layout">
+                            <!-- Top ROI Controls -->
+                            <div class="roi-controls-top">
+                                <button class="roi-btn-external" data-roi="y1" data-direction="-" title="Move top edge up (Shift for +20)">Y1-</button>
+                                <button class="roi-btn-external" data-roi="y1" data-direction="+" title="Move top edge down (Shift for +20)">Y1+</button>
+                            </div>
+
+                            <!-- Middle Row: Left Controls + Image + Right Controls -->
+                            <div class="roi-controls-middle">
+                                <!-- Left ROI Controls -->
+                                <div class="roi-controls-left">
+                                    <button class="roi-btn-external" data-roi="x1" data-direction="-" title="Move left edge left (Shift for +20)">X1-</button>
+                                    <button class="roi-btn-external" data-roi="x1" data-direction="+" title="Move left edge right (Shift for +20)">X1+</button>
+                                </div>
+
+                                <!-- OCR Preview Image -->
+                                <div class="preview-wrapper">
+                                    <div class="preview-canvas-container">
+                                        <img id="previewImage" src="" alt="OCR Preview" style="width: 100%; height: auto; display: block; min-height: 80px; background: #000;">
+                                        <div class="roi-overlay">
+                                            <div class="roi-box" id="roiBox"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Right ROI Controls -->
+                                <div class="roi-controls-right">
+                                    <button class="roi-btn-external" data-roi="x2" data-direction="-" title="Move right edge left (Shift for +20)">X2-</button>
+                                    <button class="roi-btn-external" data-roi="x2" data-direction="+" title="Move right edge right (Shift for +20)">X2+</button>
+                                </div>
+                            </div>
+
+                            <!-- Bottom ROI Controls -->
+                            <div class="roi-controls-bottom">
+                                <button class="roi-btn-external" data-roi="y2" data-direction="-" title="Move bottom edge up (Shift for +20)">Y2-</button>
+                                <button class="roi-btn-external" data-roi="y2" data-direction="+" title="Move bottom edge down (Shift for +20)">Y2+</button>
+                            </div>
+                        </div>
+
+                        <div class="confidence-display">
+                            <div style="font-size: 11px; margin-bottom: 4px;">Confidence: <strong id="confidenceText">N/A</strong></div>
+                            <div class="confidence-bar">
+                                <div class="confidence-fill" id="confidenceFill" style="width: 0%"></div>
+                            </div>
+                            <div style="font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                                ROI: [<span id="roiCoords">N/A</span>]
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Raw OCR Stream -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">Raw OCR Output</div>
+                        <span style="font-size: 9px; color: var(--accent-primary);"> Live</span>
+                    </div>
+                    <div class="panel-content">
+                        <div class="stream-content" id="rawOcrStream" style="font-family: monospace; font-size: 10px; white-space: pre-wrap; padding: 8px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 4px; max-height: 200px; overflow-y: auto;">
+                            Waiting for OCR data...
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Processed OCR Stream -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">Processed OCR</div>
+                        <span style="font-size: 9px; color: var(--accent-primary);"> Parsed</span>
+                    </div>
+                    <div class="panel-content">
+                        <table class="positions-table">
+                            <thead>
+                                <tr>
+                                    <th>Strategy</th>
+                                    <th>Symbol</th>
+                                    <th>Quantity</th>
+                                    <th>Avg Price</th>
+                                    <th>Realized P&L</th>
+                                    <th>Last Update</th>
+                                </tr>
+                            </thead>
+                            <tbody id="processedOcrTableBody">
+                                <tr><td colspan="5" style="text-align: center;">Waiting for processed data...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Enhanced Position Summary Box -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">Position Summary</div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <button class="btn" style="font-size: 8px; padding: 4px 8px;" id="requestPositionSummaryBtn" title="Refresh summary">Refresh</button>
+                            <span style="font-size: 9px; color: var(--accent-primary);">● Live</span>
+                        </div>
+                    </div>
+                    <div class="panel-content">
+                        <!-- Trading Activity Summary -->
+                        <div class="trading-metrics" style="grid-template-columns: repeat(4, 1fr); margin-bottom: 12px;">
+                            <div class="metric">
+                                <div class="metric-value" id="totalSharesTraded">0</div>
+                                <div class="metric-label">Total Shares</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" id="openPositionsCount">0</div>
+                                <div class="metric-label">Open Positions</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" id="closedPositionsCount">0</div>
+                                <div class="metric-label">Closed Today</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" id="totalTradesCount">0</div>
+                                <div class="metric-label">Total Trades</div>
+                            </div>
+                        </div>
+
+                        <!-- P&L Summary -->
+                        <div class="trading-metrics" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 12px;">
+                            <div class="metric">
+                                <div class="metric-value pnl-positive" id="openPnL">$0.00</div>
+                                <div class="metric-label">Open P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value pnl-positive" id="closedPnL">$0.00</div>
+                                <div class="metric-label">Closed P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value pnl-positive" id="totalDayPnL">$0.00</div>
+                                <div class="metric-label">Day Total P&L</div>
+                            </div>
+                        </div>
+
+                        <!-- Win Rate & Performance -->
+                        <div class="trading-metrics" style="grid-template-columns: repeat(3, 1fr);">
+                            <div class="metric">
+                                <div class="metric-value" id="winRate">0%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" id="avgWin">$0.00</div>
+                                <div class="metric-label">Avg Win</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value" id="avgLoss">$0.00</div>
+                                <div class="metric-label">Avg Loss</div>
+                            </div>
+                        </div>
+
+                        <!-- Status Indicators -->
+                        <div id="positionSummaryStatus" style="margin-top: 8px; padding: 4px 8px; background: var(--bg-secondary); border-radius: 4px; font-size: 9px; text-align: center;">
+                            <span id="positionSummaryStatusText">Waiting for position summary...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Open Positions - Live Data -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">Open Positions - Live Data</div>
+                        <div style="display: flex; gap: 12px; font-size: 11px;">
+                            <span>Open: <strong id="guiOpenPositionsCount">0</strong></span>
+                            <span class="pnl-positive" id="guiUnrealizedPnlTotal">Unrealized: <strong>+$0.00</strong></span>
+                            <div class="live-indicator" id="guiMarketDataIndicator">
+                                <div class="live-dot"></div>
+                                <span>Market Data</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel-content" id="openPositionsContainer" style="padding: 0; overflow-y: auto;">
+                        <!-- Position cards will be dynamically inserted here by JavaScript -->
+                        <div style="text-align: center; padding: 40px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;" id="noOpenPositionsMessage">
+                            <div style="font-size: 14px; margin-bottom: 8px;">📊 No Open Positions</div>
+                            <div style="font-size: 10px;">Active positions will appear here.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Enhanced Historical Trades Panel with Tabs -->
+                <div class="panel history-panel">
+                    <div class="panel-header" id="historyToggle">
+                        <div style="display: flex; align-items: center;">
+                            <div class="panel-title">Historical Trades</div>
+                            <div class="toggle-btn" id="historyToggle">+</div>
+                        </div>
+                        <div style="font-size: 10px;">
+                            <span>Today: <strong id="guiHistoryTradesTodayCount">0</strong></span>
+                            <span class="pnl-positive" id="guiHistoryRealizedPnlTotal" style="margin-left: 12px;">Realized: <strong>+$0.00</strong></span>
+                        </div>
+                    </div>
+
+                    <!-- Tab Navigation -->
+                    <div class="history-tabs">
+                        <div class="history-tab active" id="historyTabToday">Today</div>
+                        <div class="history-tab" id="historyTabWinners">Winners</div>
+                        <div class="history-tab" id="historyTabLosers">Losers</div>
+                        <div class="history-tab" id="historyTabAll">All Time</div>
+                    </div>
+
+                    <div class="history-content collapsed" id="historyContent">
+                        <!-- Historical Trades with Hierarchy Design -->
+                        <div class="historical-trades-container" id="historicalTradesContainer">
+                            <!-- Historical trade groups will be dynamically inserted here -->
+                            <div style="text-align: center; padding: 40px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;" id="noHistoricalTradesMessage">
+                                <div style="font-size: 14px; margin-bottom: 8px;">📜 No Historical Trades</div>
+                                <div style="font-size: 10px;">Completed trades will appear here.</div>
+                            </div>
+                        </div>
+
+                        <!-- Stats Summary Row -->
+                        <div class="stats-row">
+                            <div class="stat-item">
+                                <div class="stat-label">Total Trades</div>
+                                <div class="stat-value" id="histStatTotal">0</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Winners</div>
+                                <div class="stat-value pnl-positive" id="histStatWinners">0</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Losers</div>
+                                <div class="stat-value pnl-negative" id="histStatLosers">0</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Win Rate</div>
+                                <div class="stat-value pnl-positive" id="histStatWinRate">0%</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Avg Winner</div>
+                                <div class="stat-value pnl-positive" id="histStatAvgWin">+$0</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-label">Avg Loser</div>
+                                <div class="stat-value pnl-negative" id="histStatAvgLoss">-$0</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Side Panel: Controls -->
+            <div class="side-panel">
+                <!-- System Controls -->
+                <div class="control-section">
+                    <div class="control-section-title">System Controls</div>
+                    <div class="btn-group">
+                        <button class="btn btn-secondary" id="ocrToggle">Start OCR</button>
+                        <button class="btn btn-danger" id="emergencyBtn">Emergency</button>
+                    </div>
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="btn" id="startCoreBtn">Start Core</button>
+                        <button class="btn" id="toggleRecordingBtn">Recording</button>
+                    </div>
+
+
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="btn" id="expandROIBtn">Expand ROI</button>
+                        <button class="btn" id="toggleAllSymbolsBtn">All Symbols</button>
+                    </div>
+                </div>
+
+                <!-- Configuration Controls -->
+                <div class="control-section">
+                    <div class="control-section-title">Configuration</div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Initial Share Size</label>
+                        <input type="number" class="form-input" value="1000" id="initialShares">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Add Type</label>
+                        <select class="form-input" id="addType">
+                            <option value="Equal">Equal</option>
+                            <option value="CostBasis">Cost Basis</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Reduce %</label>
+                        <input type="number" class="form-input" value="50" min="1" max="100" id="reducePercent">
+                    </div>
+
+                    <div class="btn-group">
+                        <button class="btn btn-primary" id="saveConfigBtn" title="Hot-reloads control.json from disk into the application">Reload Config</button>
+                        <button class="btn" id="loadConfigBtn">Load Config</button>
+                    </div>
+                </div>
+
+                <!-- Trading Controls -->
+                <div class="control-section">
+                    <div class="control-section-title">Trading Controls</div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Manual Shares</label>
+                        <input type="number" class="form-input" value="100" id="manualShares">
+                    </div>
+
+                    <div class="btn-group">
+                        <button class="btn btn-primary" id="manualAddBtn">Manual Add</button>
+                        <button class="btn btn-warning" id="forceCloseBtn">Force Close</button>
+                    </div>
+                </div>
+
+                <!-- OCR Settings (Collapsible) -->
+                <div class="control-section">
+                    <div class="collapsible collapsed" id="ocrSettingsCollapsible">
+                        <div class="control-section-title" style="margin: 0;">OCR Settings</div>
+                    </div>
+                    <div class="collapsible-content" id="ocrSettingsContent">
+                        <!-- Basic Preprocessing Parameters -->
+                        <div class="form-group">
+                            <label class="form-label">Upscale Factor: <span class="status-value" id="upscaleValue">3.0</span></label>
+                            <input type="range" class="form-input" id="upscaleFactor" min="1.0" max="3.0" step="0.1" value="3.0" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Unsharp Strength: <span class="status-value" id="unsharpValue">1.7</span></label>
+                            <input type="range" class="form-input" id="unsharpStrength" min="1.0" max="3.0" step="0.1" value="1.7" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Threshold Block Size</label>
+                            <select class="form-input" id="thresholdBlockSize">
+                                <option value="15">15</option>
+                                <option value="21">21</option>
+                                <option value="25" selected>25</option>
+                                <option value="31">31</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Threshold C: <span class="status-value" id="thresholdCValue">-6</span></label>
+                            <input type="range" class="form-input" id="thresholdC" min="-10" max="10" step="1" value="-6" style="height: 20px;">
+                        </div>
+
+                        <!-- Color Boost Parameters -->
+                        <div class="form-group">
+                            <label class="form-label">Red Boost: <span class="status-value" id="redBoostValue">1.0</span></label>
+                            <input type="range" class="form-input" id="redBoost" min="0.5" max="2.0" step="0.1" value="1.0" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Green Boost: <span class="status-value" id="greenBoostValue">1.0</span></label>
+                            <input type="range" class="form-input" id="greenBoost" min="0.5" max="2.0" step="0.1" value="1.0" style="height: 20px;">
+                        </div>
+                        
+                        <!-- Text Mask Cleaning Parameters -->
+                        <div class="form-group">
+                            <label class="form-label">Text Mask Min Contour Area: <span class="status-value" id="contourAreaValue">5</span></label>
+                            <input type="range" class="form-input" id="textMaskMinContourArea" min="1" max="20" step="1" value="5" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Text Mask Min Width: <span class="status-value" id="maskWidthValue">2</span></label>
+                            <input type="range" class="form-input" id="textMaskMinWidth" min="1" max="10" step="1" value="2" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Text Mask Min Height: <span class="status-value" id="maskHeightValue">1</span></label>
+                            <input type="range" class="form-input" id="textMaskMinHeight" min="1" max="10" step="1" value="1" style="height: 20px;">
+                        </div>
+
+                        <!-- Symbol Enhancement Parameters -->
+                        <div class="form-group">
+                            <label class="form-label">Symbol Max Height: <span class="status-value" id="symbolMaxHeightValue">10</span></label>
+                            <input type="range" class="form-input" id="symbolMaxHeight" min="5" max="20" step="1" value="10" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Period/Comma Ratio Min: <span class="status-value" id="periodRatioMinValue">0.2</span></label>
+                            <input type="range" class="form-input" id="periodCommaRatioMin" min="0.1" max="1.0" step="0.1" value="0.2" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Period/Comma Ratio Max: <span class="status-value" id="periodRatioMaxValue">1.2</span></label>
+                            <input type="range" class="form-input" id="periodCommaRatioMax" min="1.0" max="2.0" step="0.1" value="1.2" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Period/Comma Radius: <span class="status-value" id="periodRadiusValue">5</span></label>
+                            <input type="range" class="form-input" id="periodCommaRadius" min="1" max="10" step="1" value="5" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Hyphen Min Ratio: <span class="status-value" id="hyphenRatioValue">3.0</span></label>
+                            <input type="range" class="form-input" id="hyphenMinRatio" min="1.0" max="5.0" step="0.1" value="3.0" style="height: 20px;">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Hyphen Min Height: <span class="status-value" id="hyphenHeightValue">3</span></label>
+                            <input type="range" class="form-input" id="hyphenMinHeight" min="1" max="10" step="1" value="3" style="height: 20px;">
+                        </div>
+
+                        <!-- Boolean Options -->
+                        <div class="form-group" style="display: flex; flex-direction: column; gap: 4px;">
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-secondary);">
+                                <input type="checkbox" id="forceBlackText" checked style="accent-color: var(--accent-primary);">
+                                Force Black Text on White
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-secondary);">
+                                <input type="checkbox" id="textMaskCleaning" checked style="accent-color: var(--accent-primary);">
+                                Apply Text Mask Cleaning
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-secondary);">
+                                <input type="checkbox" id="enhanceSmallSymbols" checked style="accent-color: var(--accent-primary);">
+                                Enhance Small Symbols
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-secondary);">
+                                <input type="checkbox" id="usePreprocessedImage" style="accent-color: var(--accent-primary);">
+                                Use Preprocessed Image
+                            </label>
+                        </div>
+
+                        <!-- Advanced OCR Configuration -->
+                        <div class="form-group">
+                            <label class="form-label">Video Input File Path</label>
+                            <input type="text" class="form-input" id="videoInputPath" placeholder="null (live capture)" style="font-size: 8px;">
+                        </div>
+
+                        <div class="form-group" style="display: flex; flex-direction: column; gap: 4px;">
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-secondary);">
+                                <input type="checkbox" id="videoLoopEnabled" style="accent-color: var(--accent-primary);">
+                                Enable Video Loop
+                            </label>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Tesseract Command Path</label>
+                            <input type="text" class="form-input" id="tesseractCmd" value="C:\Program Files\Tesseract-OCR\tesseract.exe" style="font-size: 8px;">
+                        </div>
+                        
+                        <div class="btn-group">
+                            <button class="btn btn-primary" id="applyOCRSettingsBtn">Apply Settings</button>
+                            <button class="btn" id="resetOCRSettingsBtn">Reset Defaults</button>
+                        </div>
+                        
+                        <div class="btn-group" style="margin-top: 6px;">
+                            <button class="btn" id="toggleConfidenceModeBtn">Confidence Mode</button>
+                            <button class="btn" id="toggleVideoModeBtn">Video Mode</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Development Settings (Collapsible) -->
+                <div class="control-section">
+                    <div class="collapsible collapsed" id="devSettingsCollapsible">
+                        <div class="control-section-title" style="margin: 0;">Development Settings</div>
+                    </div>
+                    <div class="collapsible-content" id="developmentSettingsContent">
+                        <!-- Development Mode Toggle -->
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="developmentMode" onchange="updateDevelopmentMode()">
+                                <span>Reduce Log/Storage Volume (Recommended)</span>
+                            </label>
+                            <div class="development-status" style="font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                                <span id="developmentStatusText">Active: 90% less storage, all tools still work</span>
+                            </div>
+                        </div>
+
+                        <!-- Recording Options -->
+                        <div class="form-group">
+                            <label class="form-label">Recording Options:</label>
+                            <div class="recording-options">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="enableImageRecording" onchange="updateRecordingSettings()">
+                                    <span>Images (High Memory)</span>
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="enableRawOcrRecording" onchange="updateRecordingSettings()">
+                                    <span>Raw OCR Events</span>
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="enableIntelliSenseLogging" onchange="updateRecordingSettings()">
+                                    <span>IntelliSense Logs</span>
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="enableObservabilityLogging" onchange="updateRecordingSettings()">
+                                    <span>Observability NDJSON (MASSIVE FILES!)</span>
+                                </label>
+                            </div>
+                            <div class="recording-status" style="font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                                <span id="recordingStatusText">Development Mode: No Recording</span>
+                            </div>
+                        </div>
+
+                        <!-- Logging Controls -->
+                        <div class="form-group">
+                            <label class="form-label">Logging Controls:</label>
+                            <div class="logging-options">
+                                <label class="select-label" style="font-size: 10px; color: var(--text-primary);">
+                                    <span>Log Level:</span>
+                                    <select id="logLevel" onchange="updateLoggingSettings()" style="margin-left: 4px; font-size: 9px;">
+                                        <option value="ERROR" selected>ERROR (Minimal)</option>
+                                        <option value="WARNING">WARNING</option>
+                                        <option value="INFO">INFO (Default)</option>
+                                        <option value="DEBUG">DEBUG (Verbose)</option>
+                                    </select>
+                                </label>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="enableOcrDebugLogging" onchange="updateLoggingSettings()">
+                                    <span>OCR Debug (High Volume)</span>
+                                </label>
+                            </div>
+                            <div class="logging-status" style="font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                                <span id="loggingStatusText">Current: ERROR level, OCR Debug OFF</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Enhanced Account Status -->
+                <div class="control-section">
+                    <div class="control-section-title">Account Status</div>
+
+                    <!-- Account Values -->
+                    <div class="trading-metrics" style="margin-bottom: 8px;">
+                        <div class="metric">
+                            <div class="metric-value" id="accountValue">$0</div>
+                            <div class="metric-label">Total Value</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value" id="buyingPower">$0</div>
+                            <div class="metric-label">Buying Power</div>
+                        </div>
+                    </div>
+
+                    <!-- Additional Account Metrics -->
+                    <div class="trading-metrics" style="margin-bottom: 8px;">
+                        <div class="metric">
+                            <div class="metric-value" id="buyingPowerLeft">$0</div>
+                            <div class="metric-label">BP Available</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value pnl-positive" id="dayTotalPnL">$0.00</div>
+                            <div class="metric-label">Day P&L</div>
+                        </div>
+                    </div>
+
+                    <!-- Account Utilization Bar -->
+                    <div style="margin-bottom: 8px;">
+                        <div style="font-size: 9px; color: var(--text-secondary); margin-bottom: 4px;">Buying Power Usage</div>
+                        <div style="background: var(--bg-primary); height: 8px; border-radius: 4px; overflow: hidden; border: 1px solid var(--border-subtle);">
+                            <div id="buyingPowerUsageBar" style="height: 100%; background: linear-gradient(90deg, var(--accent-primary), var(--accent-warning)); width: 0%; transition: width 0.3s ease;"></div>
+                        </div>
+                        <div style="font-size: 8px; color: var(--text-muted); margin-top: 2px;">
+                            <span id="buyingPowerUsageText">0% used</span>
+                        </div>
+                    </div>
+
+                    <!-- Account Status Indicator -->
+                    <div id="accountStatusIndicator" style="padding: 4px 8px; background: var(--bg-secondary); border-radius: 4px; font-size: 9px; text-align: center; border: 1px solid var(--border-subtle);">
+                        <span id="accountStatusText">Account status: Normal</span>
+                    </div>
+                </div>
+
+                <!-- System Messages -->
+                <div class="control-section">
+                    <div class="control-section-title">System Messages</div>
+                    <div class="stream-content" id="systemMessages" style="max-height: 120px; font-size: 8px;">
+                        <!-- Messages will appear here -->
+                    </div>
+                </div>
+
+                <!-- Advanced Controls -->
+                <div class="control-section">
+                    <div class="control-section-title">Advanced Controls</div>
+                    <div class="btn-group">
+                        <button class="btn" id="togglePerfTrackingBtn">Perf Tracking</button>
+                        <button class="btn" id="exportPerfStatsBtn">Export Stats</button>
+                    </div>
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="btn" id="resetTimeSyncBtn">Reset Time</button>
+                        <button class="btn" id="testFunctionBtn">Test Function</button>
+                    </div>
+                </div>
+
+                <!-- Session Controls -->
+                <div class="control-section">
+                    <div class="control-section-title">Session Management</div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Session Name</label>
+                        <input type="text" class="form-input" placeholder="Test Session 1" id="sessionName">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Duration (min)</label>
+                        <input type="number" class="form-input" value="60" id="sessionDuration">
+                    </div>
+
+                    <div class="btn-group">
+                        <button class="btn btn-primary" id="createSessionBtn">Create Session</button>
+                        <button class="btn" id="loadSessionDataBtn">Load Data</button>
+                    </div>
+                    
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="btn btn-primary" id="startReplayBtn">Start Replay</button>
+                        <button class="btn btn-danger" id="stopReplayBtn">Stop Replay</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer Status Bar -->
+        <div class="footer">
+            <div class="status-info">
+                <span>Feed Delay: <span class="status-value" id="feedDelay">N/A</span></span>
+                <span>OCR Confidence: <span class="status-value" id="ocrConfidence">N/A</span></span>
+                <span>Last Update: <span class="status-value" id="lastUpdate">N/A</span></span>
+            </div>
+            <div class="status-info">
+                <span>Memory: <span class="status-value">N/A</span></span>
+                <span>CPU: <span class="status-value">N/A</span></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modular JavaScript Structure -->
+    <script type="module" src="/static/js/main.js?v=11" defer></script>
+</body>
+</html>

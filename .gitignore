@@ -1,0 +1,68 @@
+# Logs and runtime data
+logs/
+*.log
+*.rdb
+*.aof
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+env/
+.venv/
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Mission Control frontend build
+mission_control/frontend/node_modules/
+mission_control/frontend/build/
+mission_control/frontend/dist/
+
+# Service data
+services/babysitter/data/
+services/babysitter/logs/
+data/
+*.dat
+*.mmap
+*.shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+.env
+
+# Session and state files
+STATE.json
+HISTORY.json
+session_handoff.json
+*.tmp
+*.temp
+
+# Large binary files
+*.zip
+*.tar.gz
+*.rar
+
+# Backup files
+*.bak
+*.backup
+*~

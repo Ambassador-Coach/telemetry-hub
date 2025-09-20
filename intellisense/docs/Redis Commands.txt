@@ -1,0 +1,196 @@
+📋 Redis Commands Reference Guide for TESTRADE V1
+🔧 Setup & Configuration Commands
+Service Management:
+bash# Check Redis service status
+sudo systemctl status redis-server
+
+# Start/Stop/Restart Redis service
+sudo systemctl start redis-server
+sudo systemctl stop redis-server
+sudo systemctl restart redis-server
+
+# Enable auto-start on boot
+sudo systemctl enable redis-server
+
+# Reload systemd configuration after changes
+sudo systemctl daemon-reload
+Configuration & Logs:
+bash# Backup original config
+sudo cp /etc/redis/redis.conf /etc/redis/redis.conf.backup_pre_testrade
+
+# View Redis logs
+sudo tail -f /var/log/redis/redis-server.log
+sudo tail -20 /var/log/redis/redis-server.log
+
+# Check systemd journal for service issues
+sudo journalctl -u redis-server.service -n 50 --no-pager
+sudo journalctl -u redis-server.service -f
+🔍 Connectivity & Status Commands
+Basic Connection Testing:
+bash# Test Redis connectivity (most important command!)
+redis-cli ping
+# Expected: PONG
+
+# Test with specific host/port
+redis-cli -h 172.22.202.120 -p 6379 ping
+
+# Test from Windows (via WSL)
+wsl redis-cli ping
+Client Connection Monitoring:
+bash# Show all connected clients
+redis-cli CLIENT LIST
+
+# Show only TESTRADE connections (redis-py)
+redis-cli CLIENT LIST | grep "redis-py"
+
+# Count connected clients
+redis-cli INFO clients | grep connected_clients
+📊 Data Inspection Commands
+Key Discovery:
+bash# Find all TESTRADE-related keys
+redis-cli KEYS "testrade:*"
+redis-cli KEYS "testrade_perf:*"
+
+# Find specific patterns
+redis-cli KEYS "*active*"
+redis-cli KEYS "*fill*" 
+redis-cli KEYS "*position*"
+
+# Get all keys (use carefully in production!)
+redis-cli KEYS "*"
+Stream Operations:
+bash# Check stream length (number of events)
+redis-cli XLEN testrade:raw-ocr-events
+redis-cli XLEN testrade:order-requests
+redis-cli XLEN testrade:internal:market-data:raw-trades
+
+# Check if stream exists and its type
+redis-cli TYPE testrade:raw-ocr-events
+
+# Read recent stream entries (last 5)
+redis-cli XREAD COUNT 5 STREAMS testrade:raw-ocr-events $
+
+# Read stream entries by ID
+redis-cli XRANGE testrade:raw-ocr-events - + COUNT 10
+🎛️ Performance & Monitoring Commands
+Memory Usage:
+bash# Check Redis memory configuration
+redis-cli CONFIG GET maxmemory
+redis-cli CONFIG GET maxmemory-policy
+
+# View memory usage
+redis-cli INFO memory
+redis-cli INFO memory | grep used_memory_human
+redis-cli INFO memory | grep maxmemory_human
+Performance Metrics:
+bash# Get Redis performance stats
+redis-cli INFO stats
+redis-cli INFO clients
+redis-cli INFO server
+
+# Check specific performance metrics
+redis-cli GET "testrade_perf:ocr_conditioning_queue_size"
+redis-cli ZRANGE "testrade_perf:eventbus.dispatch_time.MarketDataTickEvent" 0 -1
+Real-time Monitoring:
+bash# Monitor all Redis commands in real-time (CRITICAL for debugging!)
+redis-cli MONITOR
+
+# Monitor with background process
+redis-cli MONITOR &
+sleep 10
+pkill redis-cli
+
+# Watch connection count
+watch -n 2 'redis-cli INFO clients | grep connected_clients'
+
+# Watch specific metrics
+watch -n 5 'redis-cli KEYS "testrade:*" | wc -l'
+🧹 Maintenance Commands
+Database Management:
+bash# Clear all data (USE WITH CAUTION!)
+redis-cli FLUSHALL
+
+# Clear current database only
+redis-cli FLUSHDB
+
+# Check database size
+redis-cli DBSIZE
+
+# Get last save time
+redis-cli LASTSAVE
+Configuration Runtime Changes:
+bash# View current configuration
+redis-cli CONFIG GET "*"
+
+# Change configuration (temporary)
+redis-cli CONFIG SET maxmemory 8gb
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+
+# Save configuration to disk
+redis-cli CONFIG REWRITE
+🔧 Network & System Commands
+Port & Process Verification:
+bash# Check what's listening on Redis port (alternative to netstat)
+sudo ss -tlnp | grep 6379
+sudo lsof -i :6379
+
+# Check Redis processes
+ps aux | grep redis
+
+# Check system resources
+free -h
+df -h
+WSL2 Network Commands:
+bash# Get WSL2 IP address
+hostname -I | awk '{print $1}'
+ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
+
+# Test Windows to WSL2 connectivity (from Windows)
+Test-NetConnection -ComputerName 172.22.202.120 -Port 6379
+📈 Advanced Debugging Commands
+Detailed Client Analysis:
+bash# Get detailed client information
+redis-cli CLIENT LIST | head -1  # Headers
+redis-cli CLIENT LIST | grep "redis-py" | head -3
+
+# Kill specific client (if needed)
+redis-cli CLIENT KILL id 123
+
+# Set client name for easier tracking
+redis-cli CLIENT SETNAME "testrade-debug"
+Stream Debugging:
+bash# Check stream consumer groups
+redis-cli XINFO STREAM testrade:raw-ocr-events
+
+# Check consumer group status
+redis-cli XINFO GROUPS testrade:raw-ocr-events
+
+# Check pending messages
+redis-cli XPENDING testrade:raw-ocr-events group-name
+🎯 Most Critical Commands for TESTRADE
+Daily Health Check:
+bashredis-cli ping                                    # Connectivity
+redis-cli CLIENT LIST | grep "redis-py" | wc -l  # Connection count
+redis-cli KEYS "testrade:*" | wc -l              # Stream count
+redis-cli INFO memory | grep used_memory_human   # Memory usage
+Emergency Diagnostics:
+bashsudo systemctl status redis-server               # Service status
+redis-cli MONITOR &                              # Real-time monitoring
+redis-cli INFO stats | grep total_commands       # Activity level
+redis-cli CLIENT LIST | grep "redis-py"          # TESTRADE connections
+Performance Verification:
+bashredis-cli XLEN testrade:raw-ocr-events          # OCR activity
+redis-cli XLEN testrade:order-requests          # Trading activity  
+redis-cli KEYS "testrade_perf:*" | wc -l        # Metrics count
+redis-cli INFO clients | grep connected_clients  # Connection health
+💡 Command Purpose Summary
+Command CategoryPurposePINGVerify Redis is alive and respondingCLIENT LISTMonitor TESTRADE connectionsKEYSDiscover streams and dataXLENCheck stream activity levelsMONITORReal-time command debuggingINFOSystem health and performanceCONFIGRuntime configuration management
+🚀 Pro Tips
+
+Always start with redis-cli ping - if this fails, everything else will fail
+Use MONITOR for live debugging - it shows exactly what TESTRADE is doing
+Check CLIENT LIST | grep redis-py - this shows TESTRADE's connections
+Monitor memory with INFO memory - prevent out-of-memory issues
+Use KEYS "testrade:*" - to see all your trading streams
+
+These commands gave us complete visibility into the Redis infrastructure supporting your live trading system! 🎊

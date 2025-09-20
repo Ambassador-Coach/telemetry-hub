@@ -1,0 +1,88 @@
+{
+  "profiles": {
+    "list": [
+      {
+        "name": "Claude - Anthropic",
+        "commandline": "claude",
+        "colorScheme": "Claude Blue",
+        "icon": "🤖",
+        "tabColor": "#0080ff"
+      },
+      {
+        "name": "Gemini - Google",
+        "commandline": "gemini",
+        "colorScheme": "Gemini Green",
+        "icon": "💚",
+        "tabColor": "#00ff00"
+      },
+      {
+        "name": "Codex - OpenAI",
+        "commandline": "codex",
+        "colorScheme": "Codex Purple",
+        "icon": "💜",
+        "tabColor": "#9900ff"
+      },
+      {
+        "name": "GPT - OpenAI",
+        "commandline": "gpt",
+        "colorScheme": "GPT Orange",
+        "icon": "🧡",
+        "tabColor": "#ff8800"
+      }
+    ]
+  },
+  "schemes": [
+    {
+      "name": "Claude Blue",
+      "background": "#001122",
+      "foreground": "#00aaff",
+      "black": "#000000",
+      "red": "#ff3333",
+      "green": "#33ff33",
+      "yellow": "#ffff33",
+      "blue": "#0099ff",
+      "purple": "#cc33ff",
+      "cyan": "#00ffff",
+      "white": "#ffffff"
+    },
+    {
+      "name": "Gemini Green",
+      "background": "#001100",
+      "foreground": "#00ff00",
+      "black": "#000000",
+      "red": "#ff3333",
+      "green": "#00ff00",
+      "yellow": "#ffff00",
+      "blue": "#3333ff",
+      "purple": "#ff00ff",
+      "cyan": "#00ffff",
+      "white": "#ffffff"
+    },
+    {
+      "name": "Codex Purple",
+      "background": "#110022",
+      "foreground": "#cc00ff",
+      "black": "#000000",
+      "red": "#ff3333",
+      "green": "#33ff33",
+      "yellow": "#ffff33",
+      "blue": "#3333ff",
+      "purple": "#cc00ff",
+      "cyan": "#00ffff",
+      "white": "#ffffff"
+    },
+    {
+      "name": "GPT Orange",
+      "background": "#221100",
+      "foreground": "#ff9900",
+      "black": "#000000",
+      "red": "#ff3333",
+      "green": "#33ff33",
+      "yellow": "#ffcc00",
+      "blue": "#3333ff",
+      "purple": "#ff33ff",
+      "cyan": "#00ffff",
+      "white": "#ffffff"
+    }
+  ]
+}

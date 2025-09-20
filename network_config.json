@@ -1,0 +1,54 @@
+{
+    "description": "TELEMETRY Network Topology - Infrastructure Only",
+    "comment": "This file ONLY contains network plumbing. All business logic lives on BEAST.",
+    
+    "telemetry_service": {
+        "comment": "ZMQ PULL sockets - receive from BEAST",
+        "bind_addresses": {
+            "bulk": "tcp://0.0.0.0:7777",
+            "trading": "tcp://0.0.0.0:7778",
+            "system": "tcp://0.0.0.0:7779"
+        },
+        "zmq_hwm": {
+            "bulk": 50000,
+            "trading": 5000,
+            "system": 10000
+        }
+    },
+    
+    "babysitter_service": {
+        "comment": "Local IPC only - receives from TelemetryService",
+        "ipc_endpoints": {
+            "bulk": "tcp://127.0.0.1:5555",
+            "trading": "tcp://127.0.0.1:5556",
+            "system": "tcp://127.0.0.1:5557"
+        }
+    },
+    
+    "redis": {
+        "comment": "Local Redis for data persistence",
+        "host": "localhost",
+        "port": 6379,
+        "db": 0
+    },
+    
+    "gui_backend": {
+        "comment": "FastAPI server for UI",
+        "host": "0.0.0.0",
+        "port": 8001
+    },
+    
+    "mission_control": {
+        "comment": "Mission Control server",
+        "host": "0.0.0.0",
+        "port": 8000
+    },
+    
+    "network_info": {
+        "telemetry_ip": "192.168.50.101",
+        "beast_ip": "192.168.50.100",
+        "internal_network": true,
+        "encryption": false,
+        "comment": "Internal network = raw speed, no security overhead"
+    }
+}
