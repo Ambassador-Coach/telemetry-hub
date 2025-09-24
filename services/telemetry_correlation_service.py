@@ -116,6 +116,7 @@ class TelemetryCorrelationService(ITelemetryCorrelationService):
             self.config.redis_stream_trading_state_changes,
             self.config.redis_stream_config_changes,
             self.config.redis_stream_maf_decisions,
+            self.config.redis_stream_ocr_conditioning_decisions,
             self.config.redis_stream_signal_decisions,
             self.config.redis_stream_execution_decisions,
         ])
@@ -411,6 +412,26 @@ class TelemetryCorrelationService(ITelemetryCorrelationService):
                 raw_data = {k.decode('utf-8') if isinstance(k, bytes) else k:
                            v.decode('utf-8') if isinstance(v, bytes) else v
                            for k, v in fields.items()}
+
+            # Check for associated binary blobs
+            correlation_id = raw_data.get('correlation_id')
+            if correlation_id:
+                # Fetch any binary blobs associated with this message
+                blob_keys = await self.redis_client.keys(f'binary_blob:{correlation_id}:part_*')
+                if blob_keys:
+                    blobs = []
+                    for key in blob_keys:
+                        blob_data = await self.redis_client.get(key)
+                        if blob_data:
+                            blobs.append(blob_data)
+
+                    # Add blobs to raw_data
+                    if blobs:
+                        raw_data['binary_blobs'] = blobs
+                        logger.debug(f"Fetched {len(blobs)} binary blobs for correlation_id: {correlation_id}")
+
+                    # DO NOT DELETE - Let other consumers read them, TTL will expire them
+                    # Pure observer pattern - we only read, never modify
 
             # Normalize the event
             unified_event = self._normalize_event(stream_name, message_id, raw_data)
